@@ -4,7 +4,7 @@ use parking_lot::Mutex;
 use winit::{
     application::ApplicationHandler,
     event::{DeviceEvent, DeviceId, ElementState, KeyEvent, WindowEvent, MouseButton},
-    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
     keyboard::{KeyCode, PhysicalKey},
     window::{Window, WindowAttributes, WindowId},
 };
@@ -48,9 +48,32 @@ struct GlState {
     status_vbo: glow::Buffer,
 }
 
-// Snap-to request from event thread to render thread
+// Pending window-resize request, applied by the event-loop thread only.
+//
+// Every `Window` method that changes the window's size must run on the thread
+// that owns the window (the one running the event loop). On Windows this is not
+// merely a convention: `request_inner_size` reaches `SetWindowPos`, and
+// `SetWindowPos` on a window owned by *another* thread makes Win32 dispatch
+// `WM_WINDOWPOSCHANGING`/`WM_SIZE` **synchronously into the owning thread's
+// wndproc** (`SWP_ASYNCWINDOWPOS` only affects the caller's return, not the
+// callback delivery). winit's Windows `EventLoopRunner` holds its event handler
+// and buffer in `Cell`/`RefCell` with no synchronisation whatsoever, so that
+// re-entrant dispatch races the event thread's own dispatch and panics inside a
+// Win32 callback — which the OS turns into a process kill with
+// STATUS_FATAL_USER_CALLBACK_EXCEPTION (0xC000041D), no Rust backtrace.
+// Symptom seen in the wild: iris dying ~90% of launches right after REX3
+// reports its first resolution change, because that change is exactly what used
+// to call `request_inner_size` from the REX3 refresh thread.
+//
+// So both resize sources — the REX3 refresh thread's mode change and the
+// RCtrl+1/2 hotkey — only *record* what they want here; `UiApp` applies it.
 #[derive(Clone, Copy, PartialEq)]
-enum ScaleSnap { Scale1x, Scale2x }
+enum ResizeRequest {
+    /// Emulated display changed mode: snap the window to 1x of the new size.
+    DisplayMode { w: u32, h: u32 },
+    /// RCtrl+1 / RCtrl+2: snap to an integer multiple of the current display.
+    Scale(u32),
+}
 
 // Which context we actually got. GlCompositor and the texelFetch/integer-sampler
 // shaders need GL 3.2 core (usampler2D, #version 150). If the driver can't give us
@@ -74,7 +97,13 @@ struct GlRenderer {
     raw_window_handle: RawWindowHandle,
     gl_tier: GlTier,
     window_size: Arc<Mutex<Option<(u32, u32)>>>,
-    scale_snap:  Arc<Mutex<Option<ScaleSnap>>>,
+    // Resize wanted by this (render) thread, applied by the event thread.
+    // Never call a window-mutating method from here — see `ResizeRequest`.
+    resize_request: Arc<Mutex<Option<ResizeRequest>>>,
+    // Waker for the event loop: the resize request above is useless until the
+    // event thread wakes up to notice it, and with ControlFlow::Wait an idle
+    // guest may produce no OS events at all for a long time.
+    event_proxy: EventLoopProxy<()>,
     // Current emulated display resolution (width, height), published for the
     // event thread so it can lock the window to the right aspect ratio.
     display_res: Arc<Mutex<(u32, u32)>>,
@@ -461,15 +490,6 @@ impl Renderer for GlRenderer {
         let state = self.state.as_mut().unwrap();
         let gl    = &state.gl;
 
-        // Handle pending scale-snap from keyboard hotkey (RCtrl+1 / RCtrl+2).
-        if let Some(snap) = self.scale_snap.lock().take() {
-            let s = match snap { ScaleSnap::Scale1x => 1u32, ScaleSnap::Scale2x => 2u32 };
-            let _ = self.window.request_inner_size(winit::dpi::PhysicalSize::new(
-                width as u32 * s,
-                (height as u32 + STATUS_BAR_HEIGHT as u32) * s,
-            ));
-        }
-
         // Handle window resize — take the latest queued size.
         let (win_w, win_h) = if let Some((w, h)) = self.window_size.lock().take() {
             state.surface.resize(
@@ -595,11 +615,15 @@ impl Renderer for GlRenderer {
         // thread's aspect lock sees it when it handles the resulting Resized
         // event (otherwise it would re-fit the window to the stale aspect).
         *self.display_res.lock() = (width as u32, height as u32);
-        // On display resolution change, snap window to 1x of the new resolution.
-        let _ = self.window.request_inner_size(winit::dpi::PhysicalSize::new(
-            width as u32,
-            (height + STATUS_BAR_HEIGHT) as u32,
-        ));
+        // On display resolution change, snap the window to 1x of the new
+        // resolution — but only ever *ask*. This runs on REX3's refresh thread,
+        // and touching the window from here is what used to kill iris on
+        // Windows; see `ResizeRequest` for the full mechanism.
+        *self.resize_request.lock() = Some(ResizeRequest::DisplayMode {
+            w: width as u32,
+            h: (height + STATUS_BAR_HEIGHT) as u32,
+        });
+        let _ = self.event_proxy.send_event(());
     }
 
     fn stop(&mut self) {
@@ -670,7 +694,7 @@ pub struct Ui {
     scsi: Arc<Wd33c93a>,
     window: Arc<Window>,
     window_size: Arc<Mutex<Option<(u32, u32)>>>,
-    scale_snap:  Arc<Mutex<Option<ScaleSnap>>>,
+    resize_request: Arc<Mutex<Option<ResizeRequest>>>,
     display_res: Arc<Mutex<(u32, u32)>>,
     timer_manager: Arc<TimerManager>,
     initial_scale: u32,
@@ -744,8 +768,8 @@ impl Ui {
             .expect("failed to create a GL context under any requested version/profile");
         eprintln!("iris: using GL tier {:?}", gl_tier);
 
-        let window_size = Arc::new(Mutex::new(None));
-        let scale_snap  = Arc::new(Mutex::new(None));
+        let window_size    = Arc::new(Mutex::new(None));
+        let resize_request = Arc::new(Mutex::new(None));
         // Seed with the Indy's default 1280×1024; the render thread republishes
         // the real resolution on the first frame and on any mode change.
         let display_res = Arc::new(Mutex::new((1280u32, 1024u32)));
@@ -766,7 +790,8 @@ impl Ui {
             raw_window_handle,
             gl_tier,
             window_size: window_size.clone(),
-            scale_snap:  scale_snap.clone(),
+            resize_request: resize_request.clone(),
+            event_proxy: event_loop.create_proxy(),
             display_res: display_res.clone(),
             state:       None,
             compositor,
@@ -779,12 +804,12 @@ impl Ui {
 
         *rex3.renderer.lock() = Some(Box::new(renderer));
 
-        Self { ps2, rex3, scsi, window, window_size, scale_snap, display_res, timer_manager, initial_scale: scale, scroll_pixels_per_line, lock_aspect_ratio }
+        Self { ps2, rex3, scsi, window, window_size, resize_request, display_res, timer_manager, initial_scale: scale, scroll_pixels_per_line, lock_aspect_ratio }
     }
 
     /// Run the UI event loop (blocks the current thread)
     pub fn run(self, event_loop: EventLoop<()>) {
-        let Ui { ps2, rex3, scsi, window, window_size, scale_snap, display_res, timer_manager, initial_scale, scroll_pixels_per_line, lock_aspect_ratio } = self;
+        let Ui { ps2, rex3, scsi, window, window_size, resize_request, display_res, timer_manager, initial_scale, scroll_pixels_per_line, lock_aspect_ratio } = self;
         let scale = initial_scale;
 
         let last_win_size = {
@@ -809,7 +834,7 @@ impl Ui {
 
         event_loop.set_control_flow(ControlFlow::Wait);
         let mut app = UiApp {
-            ps2, rex3, scsi, window, window_size, scale_snap, display_res, mouse_delta,
+            ps2, rex3, scsi, window, window_size, resize_request, display_res, mouse_delta,
             scale, scroll_pixels_per_line, lock_aspect_ratio,
             mouse_grabbed: false, rctrl_held: false, last_win_size,
         };
@@ -857,7 +882,8 @@ impl Ui {
         }
     }
 
-    fn handle_keyboard(ps2: &Ps2Controller, rex3: &Rex3, scsi: &Wd33c93a, scale_snap: &Mutex<Option<ScaleSnap>>,
+    fn handle_keyboard(ps2: &Ps2Controller, rex3: &Rex3, scsi: &Wd33c93a,
+        resize_request: &Mutex<Option<ResizeRequest>>,
         input: KeyEvent, grabbed: &mut bool, rctrl_held: &mut bool, window: &Window)
     {
         use std::sync::atomic::Ordering;
@@ -924,12 +950,16 @@ impl Ui {
             // RCtrl+1 / RCtrl+2: snap window to 1x or 2x scale.
             if pressed && !input.repeat && *rctrl_held {
                 let snap = match keycode {
-                    KeyCode::Digit1 => Some(ScaleSnap::Scale1x),
-                    KeyCode::Digit2 => Some(ScaleSnap::Scale2x),
+                    KeyCode::Digit1 => Some(1u32),
+                    KeyCode::Digit2 => Some(2u32),
                     _ => None,
                 };
                 if let Some(s) = snap {
-                    *scale_snap.lock() = Some(s);
+                    // Recorded rather than applied inline: we are already
+                    // inside a winit event callback, and on Windows resizing
+                    // from in here re-enters the wndproc. `about_to_wait`
+                    // applies it once we're back out of the callback.
+                    *resize_request.lock() = Some(ResizeRequest::Scale(s));
                     return;
                 }
             }
@@ -946,7 +976,7 @@ struct UiApp {
     scsi:        Arc<Wd33c93a>,
     window:      Arc<Window>,
     window_size: Arc<Mutex<Option<(u32, u32)>>>,
-    scale_snap:  Arc<Mutex<Option<ScaleSnap>>>,
+    resize_request: Arc<Mutex<Option<ResizeRequest>>>,
     display_res: Arc<Mutex<(u32, u32)>>,
     mouse_delta: Arc<Mutex<MouseDelta>>,
     scale: u32,
@@ -967,35 +997,35 @@ impl ApplicationHandler for UiApp {
             WindowEvent::CloseRequested => { event_loop.exit() },
             WindowEvent::Resized(size) => {
                 if size.width != 0 && size.height != 0 {
-                    let mut new_size = (size.width, size.height);
                     // Lock the window to the display's aspect ratio so the
                     // picture fills it without letterbox bars. Skipped when
                     // fullscreen or maximized (aspect can't be honoured there)
                     // and when disabled by config.
+                    //
+                    // The correction is queued, not applied here: we are inside
+                    // an event callback, and resizing from within one re-enters
+                    // the wndproc on Windows. `about_to_wait` applies it a
+                    // moment later, which also coalesces a burst of Resized
+                    // events (a mouse drag) into a single correction.
                     if self.lock_aspect_ratio
                         && self.window.fullscreen().is_none()
                         && !self.window.is_maximized()
                     {
                         let (dw, dh) = *self.display_res.lock();
-                        if let Some(fixed) = Ui::aspect_fit(
+                        if let Some((w, h)) = Ui::aspect_fit(
                             size.width, size.height, self.last_win_size, dw, dh)
                         {
-                            new_size = match self.window.request_inner_size(
-                                winit::dpi::PhysicalSize::new(fixed.0, fixed.1))
-                            {
-                                // Some => applied synchronously, no further
-                                // Resized event; use the actual granted size.
-                                Some(actual) => (actual.width, actual.height),
-                                None => fixed,
-                            };
+                            *self.resize_request.lock() =
+                                Some(ResizeRequest::DisplayMode { w, h });
                         }
                     }
+                    let new_size = (size.width, size.height);
                     self.last_win_size = new_size;
                     *self.window_size.lock() = Some(new_size);
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                Ui::handle_keyboard(&self.ps2, &self.rex3, &self.scsi, &self.scale_snap, event,
+                Ui::handle_keyboard(&self.ps2, &self.rex3, &self.scsi, &self.resize_request, event,
                     &mut self.mouse_grabbed, &mut self.rctrl_held, &self.window);
             }
             WindowEvent::MouseInput { state, button, .. } => {
@@ -1042,6 +1072,49 @@ impl ApplicationHandler for UiApp {
                 // Rendering is driven by the Rex3 refresh thread
             }
             _ => (),
+        }
+    }
+
+    // Wakeup from the render thread's `event_proxy.send_event(())`. The
+    // payload carries no information — the request itself is in
+    // `resize_request`, and `about_to_wait` (which always runs after this)
+    // is what applies it.
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: ()) {}
+
+    // The one place window-resizing actually happens. Running it here rather
+    // than inside a `window_event` arm matters: winit has finished dispatching
+    // the current batch of OS messages, so `request_inner_size` — which on
+    // Windows synchronously re-enters the wndproc with WM_SIZE — cannot land
+    // in the middle of another event callback. Combined with never calling it
+    // off-thread at all (see `ResizeRequest`), that removes both halves of the
+    // re-entrancy hazard.
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        let Some(req) = self.resize_request.lock().take() else { return };
+
+        // A resize is meaningless while fullscreen or maximized — the window
+        // manager owns the size — and applying one would fight it.
+        if self.window.fullscreen().is_some() || self.window.is_maximized() {
+            return;
+        }
+
+        let (w, h) = match req {
+            ResizeRequest::DisplayMode { w, h } => (w, h),
+            ResizeRequest::Scale(s) => {
+                let (dw, dh) = *self.display_res.lock();
+                if dw == 0 || dh == 0 { return; }
+                (dw * s, (dh + STATUS_BAR_HEIGHT as u32) * s)
+            }
+        };
+        if w == 0 || h == 0 { return; }
+
+        let size = winit::dpi::PhysicalSize::new(w, h);
+        if let Some(actual) = self.window.request_inner_size(size) {
+            // Applied synchronously: no Resized event will follow, so publish
+            // the new size ourselves or the renderer keeps the stale one.
+            if actual.width != 0 && actual.height != 0 {
+                self.last_win_size = (actual.width, actual.height);
+                *self.window_size.lock() = Some((actual.width, actual.height));
+            }
         }
     }
 
