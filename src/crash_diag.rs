@@ -173,13 +173,16 @@ mod windows {
     use windows_sys::Win32::Foundation::HMODULE;
     use windows_sys::Win32::System::Diagnostics::Debug::{
         AddVectoredExceptionHandler, RtlCaptureStackBackTrace, SetUnhandledExceptionFilter,
-        EXCEPTION_POINTERS,
+        SymFromAddr, SymGetLineFromAddr64, SymInitializeW, SymLoadModuleExW, SymSetOptions,
+        SymUnloadModule64, EXCEPTION_POINTERS, IMAGEHLP_LINE64, SYMBOL_INFO,
+        SYMOPT_FAIL_CRITICAL_ERRORS, SYMOPT_LOAD_LINES, SYMOPT_NO_PROMPTS, SYMOPT_UNDNAME,
     };
     use windows_sys::Win32::System::LibraryLoader::{
         GetModuleFileNameW, GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
         GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
     };
     use windows_sys::Win32::System::SystemInformation::GetTickCount64;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
     // From <winnt.h>. windows-sys spreads these across modules / doesn't re-export
     // them all as consts, so spell them out.
@@ -312,11 +315,26 @@ mod windows {
         // alone are already useful.
         emit(buf.as_bytes());
 
+        let mut frames: [*mut core::ffi::c_void; 62] = [core::ptr::null_mut(); 62];
+        let n = RtlCaptureStackBackTrace(0, frames.len() as u32, frames.as_mut_ptr(), core::ptr::null_mut())
+            as usize;
+        let frames = &frames[..n];
+
+        // Phase A — raw `module+offset`. No heap, always safe, flushed first.
         let mut tail = FixedBuf::<8192>::new();
-        let _ = tail.write_str("stack (return addresses, resolve with the matching .pdb / addr2line):\n");
-        write_backtrace(&mut tail);
-        let _ = tail.write_str("================================================\n");
+        let _ = tail.write_str("stack (raw — module + offset):\n");
+        write_backtrace_raw(&mut tail, frames);
         emit(tail.as_bytes());
+
+        // Phase B — dbghelp symbolisation. Allocates and touches the loader, so
+        // it comes *after* phase A is on disk; a fault in here re-enters the VEH,
+        // hits the DUMPED guard and bails, leaving phase A intact. Needs
+        // `iris.pdb` next to the exe (the release profile emits it).
+        let mut sym = FixedBuf::<8192>::new();
+        let _ = sym.write_str("stack (symbolised — iris.pdb frames + module exports):\n");
+        write_backtrace_symbolised(&mut sym, frames);
+        let _ = sym.write_str("================================================\n");
+        emit(sym.as_bytes());
 
         // Breadcrumb in case stderr is a pipe nobody is tailing.
         let _ = std::io::Write::write_all(
@@ -336,11 +354,14 @@ mod windows {
         EXCEPTION_CONTINUE_SEARCH
     }
 
-    /// Walk up to 62 frames and append `module.dll+0xoffset  (0xabsolute)` lines.
-    unsafe fn write_backtrace(buf: &mut dyn core::fmt::Write) {
-        let mut frames: [*mut core::ffi::c_void; 62] = [core::ptr::null_mut(); 62];
-        let n = RtlCaptureStackBackTrace(0, frames.len() as u32, frames.as_mut_ptr(), core::ptr::null_mut());
-        for &frame in frames.iter().take(n as usize) {
+    /// `#N  module.dll+0xoffset  (0xabsolute)` per frame. No heap, no dbghelp —
+    /// this is the line that always makes it out.
+    unsafe fn write_backtrace_raw(buf: &mut dyn core::fmt::Write, frames: &[*mut core::ffi::c_void]) {
+        if frames.is_empty() {
+            let _ = buf.write_str("  <no frames captured>\n");
+            return;
+        }
+        for (i, &frame) in frames.iter().enumerate() {
             let addr = frame as usize;
             let mut module: HMODULE = core::ptr::null_mut();
             let ok = GetModuleHandleExW(
@@ -356,15 +377,162 @@ mod windows {
                 let name = basename_utf8(&wide[..len.min(wide.len())]);
                 let _ = core::fmt::write(
                     buf,
-                    format_args!("  {}+0x{:X}  (0x{:016X})\n", name.as_str(), addr - base, addr),
+                    format_args!("  #{i:<2} {}+0x{:X}  (0x{:016X})\n", name.as_str(), addr - base, addr),
                 );
             } else {
-                let _ = core::fmt::write(buf, format_args!("  ???+0x0  (0x{addr:016X})\n"));
+                let _ = core::fmt::write(buf, format_args!("  #{i:<2} ???  (0x{addr:016X})\n"));
             }
         }
-        if n == 0 {
-            let _ = buf.write_str("  <no frames captured>\n");
+    }
+
+    /// `#N  symbol_name  at file:line` per frame, via dbghelp against whatever
+    /// PDBs are reachable (`iris.pdb` beside the exe; `_NT_SYMBOL_PATH` for the
+    /// rest, otherwise export names). Best-effort: any frame that doesn't
+    /// resolve just prints its raw address.
+    unsafe fn write_backtrace_symbolised(buf: &mut dyn core::fmt::Write, frames: &[*mut core::ffi::c_void]) {
+        static TRIED: AtomicBool = AtomicBool::new(false);
+        if TRIED.swap(true, Ordering::SeqCst) {
+            let _ = buf.write_str("  <symbolisation already attempted>\n");
+            return;
         }
+        if frames.is_empty() {
+            return;
+        }
+
+        let proc = GetCurrentProcess();
+        SymSetOptions(
+            SYMOPT_UNDNAME | SYMOPT_LOAD_LINES | SYMOPT_FAIL_CRITICAL_ERRORS | SYMOPT_NO_PROMPTS,
+        );
+
+        // Search path = the executable's own directory (+ cwd). Without this,
+        // dbghelp's default search does NOT reliably include the exe dir, so it
+        // never finds `iris.pdb` sitting right next to `iris.exe` and every
+        // iris frame stays unresolved. (This was the whole reason symbolisation
+        // silently produced nothing on the first cut.)
+        let mut sp = [0u16; 600];
+        let mut spn = 0usize;
+        {
+            let mut exe = [0u16; 260];
+            let n = GetModuleFileNameW(core::ptr::null_mut(), exe.as_mut_ptr(), exe.len() as u32)
+                as usize;
+            let dir = exe[..n.min(exe.len())]
+                .iter()
+                .rposition(|&c| c == b'\\' as u16)
+                .unwrap_or(0);
+            for &c in &exe[..dir] {
+                if spn < sp.len() - 4 {
+                    sp[spn] = c;
+                    spn += 1;
+                }
+            }
+            for &c in &[b';' as u16, b'.' as u16] {
+                sp[spn] = c;
+                spn += 1;
+            }
+            sp[spn] = 0;
+        }
+        // We also register each frame's module ourselves (below) rather than
+        // trust `fInvadeProcess` — some dbghelp versions auto-register the main
+        // .exe with no symbols (SymType == SymNone), after which a plain
+        // SymLoadModuleExW no-ops. A second SymInitialize (std's backtrace beat
+        // us to it) returns FALSE and is fine.
+        SymInitializeW(proc, sp.as_ptr(), 0);
+
+        // SYMBOL_INFO has a trailing flexible `Name[1]`; over-allocate behind it.
+        const NAME_CAP: usize = 512;
+        #[repr(C)]
+        struct SymPacket {
+            info: SYMBOL_INFO,
+            _name_tail: [u8; NAME_CAP],
+        }
+        let mut any = false;
+        let mut loaded_base = 0usize; // dedupe: consecutive frames share a module
+        for (i, &frame) in frames.iter().enumerate() {
+            let addr = frame as u64;
+
+            // Make sure dbghelp knows the module this address belongs to.
+            let mut module: HMODULE = core::ptr::null_mut();
+            let mut wide = [0u16; 260];
+            if GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                frame as *const u16,
+                &mut module,
+            ) != 0
+                && !module.is_null()
+                && module as usize != loaded_base
+            {
+                let len =
+                    GetModuleFileNameW(module, wide.as_mut_ptr(), wide.len() as u32) as usize;
+                if len > 0 && len < wide.len() {
+                    loaded_base = module as usize;
+                    // dbghelp may have auto-registered the primary module with
+                    // no symbols (SymType == SymNone); a plain SymLoadModuleExW
+                    // then no-ops ("already loaded"). Drop it first so the
+                    // reload actually goes looking for the PDB.
+                    SymUnloadModule64(proc, module as u64);
+                    SymLoadModuleExW(
+                        proc,
+                        core::ptr::null_mut(),
+                        wide.as_ptr(),
+                        core::ptr::null(),
+                        module as u64,
+                        0,
+                        core::ptr::null(),
+                        0,
+                    );
+                }
+            }
+
+            let mut pkt: SymPacket = core::mem::zeroed();
+            pkt.info.SizeOfStruct = core::mem::size_of::<SYMBOL_INFO>() as u32;
+            pkt.info.MaxNameLen = NAME_CAP as u32;
+            let mut disp: u64 = 0;
+            let have_sym = SymFromAddr(proc, addr, &mut disp, &mut pkt.info) != 0;
+
+            let mut line: IMAGEHLP_LINE64 = core::mem::zeroed();
+            line.SizeOfStruct = core::mem::size_of::<IMAGEHLP_LINE64>() as u32;
+            let mut line_disp: u32 = 0;
+            let have_line = SymGetLineFromAddr64(proc, addr, &mut line_disp, &mut line) != 0;
+
+            let _ = core::fmt::write(buf, format_args!("  #{i:<2} "));
+            if have_sym {
+                any = true;
+                let name = cstr(pkt.info.Name.as_ptr() as *const u8, pkt.info.NameLen as usize + 1);
+                let _ = core::fmt::write(buf, format_args!("{}+0x{:X}", name.as_str(), disp));
+            } else {
+                let _ = core::fmt::write(buf, format_args!("0x{addr:016X}"));
+            }
+            if have_line {
+                let file = cstr(line.FileName as *const u8, 260);
+                let _ = core::fmt::write(
+                    buf,
+                    format_args!("  at {}:{}", file.as_str(), line.LineNumber),
+                );
+            }
+            let _ = buf.write_str("\n");
+        }
+        if !any {
+            let _ = buf.write_str(
+                "  (nothing resolved — is iris.pdb next to the exe? try: \
+                 cdb -z iris.exe -c \"ln iris+<rva>;q\")\n",
+            );
+        }
+    }
+
+    /// Copy a NUL-terminated C string (bounded) into a fixed no-heap buffer.
+    unsafe fn cstr(p: *const u8, max: usize) -> ArrString<300> {
+        let mut s = ArrString::<300>::new();
+        if p.is_null() {
+            return s;
+        }
+        for i in 0..max.min(300) {
+            let b = *p.add(i);
+            if b == 0 {
+                break;
+            }
+            s.push(b as char);
+        }
+        s
     }
 
     /// Last path component of a UTF-16 path, lossily narrowed into a small

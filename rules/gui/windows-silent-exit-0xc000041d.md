@@ -32,14 +32,21 @@ lost, and there is no unwind and no backtrace unless `RUST_BACKTRACE` is set.
 * **Panic hook** — fires even under `panic = "abort"`, before the abort. Writes
   message + thread + location + backtrace to `iris-crash.log`.
 * **Vectored exception handler** (Windows) — runs *first-chance*, before the
-  callback dispatcher swallows anything. Logs the real exception code, faulting
-  address and a `module+offset` stack for access violations / illegal
-  instructions / stack overflow / heap corruption / the fatal-callback status
-  itself.
+  callback dispatcher swallows anything. For access violations / illegal /
+  privileged instructions / stack overflow / heap corruption / the
+  fatal-callback status it logs the exception code, faulting address, and the
+  stack **twice**: a raw `module+offset` list (no heap — always makes it out),
+  then a dbghelp-symbolised list (`function+off  at file:line`) resolved
+  against `iris.pdb`. dbghelp's default search does not reliably include the
+  exe's own directory, so `crash_diag` passes it explicitly to
+  `SymInitializeW` — without that, every iris frame silently stays unresolved.
 
-Ask a reporter to reproduce once and attach `iris-crash.log`. Symbolize the
-`iris.exe+0xNNNN` frames against the matching build with
-`addr2line -e iris.exe -f -C 0xNNNN` (or the `.pdb`).
+Ask a reporter to reproduce once and attach `iris-crash.log` — it is
+self-symbolising as long as `iris.pdb` sits next to `iris.exe` (the release
+profile emits it; ship them together). If only the raw list resolved, feed the
+`iris.exe+0xNNNN` RVAs to `cdb -z iris.exe -c "ln iris+0xNNNN;q"` or
+`llvm-symbolizer --obj=iris.exe --relative-address` — **not** `addr2line`, MSVC
+PDBs are not DWARF.
 
 Self-test the wiring: `IRIS_CRASH_SELFTEST=panic|thread|segv target/release/iris.exe`.
 Escape hatch if the VEH ever gets noisy: `IRIS_CRASH_DIAG=off` (panic hook stays).
@@ -78,11 +85,47 @@ the `pending_drag` / `source_drag` fields were added so the blocking
 should follow suit — never call a synchronous window-mutating method from
 inside a winit callback; queue it and apply it from outside dispatch.
 
-## Working hypothesis
+## Confirmed cause (from a reporter's `iris-crash.log`)
 
-Given the panel dependency and that `panic = "unwind"` + `RUST_BACKTRACE=full`
-produced *no* Rust output, the fault is most likely **not a Rust panic** but a
-native access violation inside the wndproc — the GL ICD mishandling the HWND/DC
-while `GlRenderer::ensure_init` creates the window surface on the REX3 thread at
-the same moment the event thread services the mode-change resize. The VEH in
-`crash_diag.rs` is what will confirm or refute this from a reporter's machine.
+    code       : 0xC0000005  ACCESS_VIOLATION
+    access     : read @ 0x0000000000000000
+    fault addr : atio6axx.dll+0x87DF84
+    …
+      atio6axx.dll+0x876AD3
+      USER32.dll  (x3)                 ← window-procedure / hook thunk
+      ntdll.dll  KiUserCallbackDispatcher
+      win32u.dll                        ← NtUser… syscall
+      iris.exe   (winit → a windowing call)
+      … iris::main   (MAIN THREAD)
+
+`atio6axx.dll` is the **AMD/ATI 64-bit OpenGL ICD**. It null-derefs on a
+**read**, on the **main (event-loop) thread**, inside a **window procedure** —
+the `win32u → KiUserCallbackDispatcher → USER32 → wndproc` sequence is Windows
+running the GL window's proc *synchronously* as part of a winit windowing call
+(`SetWindowPos`, `SetPixelFormat`, window show/create — symbolise the reporter's
+log to see which).
+
+OpenGL on Windows does **not** require the context to be created or made current
+on the window-owning thread (WGL contexts move between threads freely; only
+"current on one thread at a time" applies), and iris keeps all GL *calls* on the
+REX3 refresh thread. But the AMD ICD **subclasses the GL window** and its
+wndproc hook runs on whatever thread owns the window — the main thread — while
+iris does `SetPixelFormat` + the first `wglMakeCurrent` (via glutin's
+`create_window_surface` / `make_current` in `GlRenderer::ensure_init`) on the
+**REX3 thread**. A window message reaching the AMD hook before that per-HWND GL
+state is populated → null deref. AMD's ICD is historically the worst offender
+for this cross-thread setup race.
+
+## Fix direction
+
+Establish the drawable fully on the **main thread, before `Ui::run` starts the
+event loop** (no messages are being pumped yet, so the AMD hook can't fire
+mid-setup): create the `Surface` and do the first `make_current` in `Ui::new`,
+then `make_not_current()` and hand both the `NotCurrentContext` and the
+`Surface` to `GlRenderer`. `ensure_init` on the REX3 thread then only
+re-`make_current`s on its own thread — the "moving a context between threads"
+pattern, which WGL explicitly supports. Rendering stays on REX3; only the
+one-time pixel-format + initial bind moves. (The macOS main-thread
+`window_handle()` constraint is already satisfied — the handle is captured in
+`Ui::new` — so this is compatible with
+`rules/macos/winit-030-window-handle-main-thread-only.md`.)
