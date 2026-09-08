@@ -73,6 +73,11 @@ enum ResizeRequest {
     DisplayMode { w: u32, h: u32 },
     /// RCtrl+1 / RCtrl+2: snap to an integer multiple of the current display.
     Scale(u32),
+    /// RCtrl+F11: toggle borderless fullscreen. Same deferral rationale as the
+    /// others — `set_fullscreen` inside a callback re-enters the wndproc with a
+    /// whole style/geometry change (WM_WINDOWPOSCHANGING, WM_SIZE,
+    /// possibly WM_DPICHANGED when the window lands on a different monitor).
+    ToggleFullscreen,
 }
 
 // Which context we actually got. GlCompositor and the texelFetch/integer-sampler
@@ -110,6 +115,12 @@ struct GlRenderer {
     state:       Option<GlState>,
     compositor:  Box<dyn Compositor>,
     use_gl_compositor: bool,
+    // Compositor swap asked for by `disp compositor <gl|sw>`, which arrives on
+    // a monitor/CI socket thread. Swapping means `glDeleteTextures` on the old
+    // compositor, and GL calls belong to the refresh thread that owns the
+    // context — so the request is only recorded here and serviced at the top of
+    // `present()`. See rules/gui/gl-teardown-must-run-on-the-refresh-thread.md.
+    pending_compositor: Option<bool>,
     current_w:     usize,
     current_h:     usize,
     current_win_w: usize,
@@ -448,6 +459,20 @@ impl GlRenderer {
         let y0 = ((win_h - disp_h - sb_h) * 0.5).floor();
         (x0, y0, x0 + disp_w, y0 + disp_h, scale)
     }
+
+    /// Service a pending `disp compositor` swap. Refresh thread only: this is
+    /// where the old compositor's GL objects are actually deleted.
+    fn apply_pending_compositor(&mut self, gl: &glow::Context) {
+        let Some(use_gl) = self.pending_compositor.take() else { return };
+        if use_gl == self.use_gl_compositor { return; }
+        self.use_gl_compositor = use_gl;
+        self.compositor.destroy(gl);
+        self.compositor = if use_gl {
+            Box::new(GlCompositor::new())
+        } else {
+            Box::new(SwCompositor::new())
+        };
+    }
 }
 
 impl Renderer for GlRenderer {
@@ -486,6 +511,17 @@ impl Renderer for GlRenderer {
         let width  = screen.width;
         let height = screen.height;
         if width == 0 || height == 0 { return; }
+
+        // Apply any pending `disp compositor` swap now, on the thread that owns
+        // the GL context. Done before the frame's `state` borrow so the old
+        // compositor's textures are deleted with a live, current context.
+        if self.pending_compositor.is_some() {
+            // Move the context out of `self.state` for the call: destroy() needs
+            // `&mut self` (it replaces `self.compositor`) and `&gl` at once.
+            let state = self.state.take().unwrap();
+            self.apply_pending_compositor(&state.gl);
+            self.state = Some(state);
+        }
 
         let state = self.state.as_mut().unwrap();
         let gl    = &state.gl;
@@ -662,21 +698,18 @@ impl Renderer for GlRenderer {
         format!("compositor={} shader=integer+fallback", comp)
     }
 
+    // Called from the monitor/CI socket thread — NOT the context-owning refresh
+    // thread — so it must not touch GL. Record the request; `present()` applies
+    // it. The returned name is what the swap will settle on, which for a Legacy
+    // (GL 2.1) context is always "sw": GlCompositor needs 3.2 core.
     fn switch_compositor(&mut self, use_gl: bool) -> &'static str {
+        let use_gl = use_gl && self.gl_tier == GlTier::Core32;
         if use_gl == self.use_gl_compositor {
+            self.pending_compositor = None;
             return if use_gl { "gl" } else { "sw" };
         }
-        self.use_gl_compositor = use_gl;
-        if let Some(state) = &self.state {
-            self.compositor.destroy(&state.gl);
-        }
-        if use_gl {
-            self.compositor = Box::new(GlCompositor::new());
-            "gl"
-        } else {
-            self.compositor = Box::new(SwCompositor::new());
-            "sw"
-        }
+        self.pending_compositor = Some(use_gl);
+        if use_gl { "gl" } else { "sw" }
     }
 
 }
@@ -796,6 +829,7 @@ impl Ui {
             state:       None,
             compositor,
             use_gl_compositor,
+            pending_compositor: None,
             current_w:     0,
             current_h:     0,
             current_win_w: 0,
@@ -882,7 +916,7 @@ impl Ui {
         }
     }
 
-    fn handle_keyboard(ps2: &Ps2Controller, rex3: &Rex3, scsi: &Wd33c93a,
+    fn handle_keyboard(ps2: &Ps2Controller, rex3: &Rex3, scsi: &Arc<Wd33c93a>,
         resize_request: &Mutex<Option<ResizeRequest>>,
         input: KeyEvent, grabbed: &mut bool, rctrl_held: &mut bool, window: &Window)
     {
@@ -906,12 +940,10 @@ impl Ui {
             }
 
             if keycode == KeyCode::F11 && pressed && !input.repeat && *rctrl_held {
-                let new_mode = if window.fullscreen().is_some() {
-                    None
-                } else {
-                    Some(winit::window::Fullscreen::Borderless(None))
-                };
-                window.set_fullscreen(new_mode);
+                // Queued, not applied here: see `ResizeRequest`. Resolving
+                // fullscreen-vs-windowed is deferred to apply time too, so the
+                // toggle reads the state it will actually act on.
+                *resize_request.lock() = Some(ResizeRequest::ToggleFullscreen);
                 return;
             }
 
@@ -921,26 +953,45 @@ impl Ui {
                 let cdrom_id = scsi.disc_status().first().map(|(id, ..)| *id);
 
                 if let Some(id) = cdrom_id {
-                    // Open file picker (blocks the event loop but winit tolerates it on most platforms)
-                    if let Some(path) = rfd::FileDialog::new()
-                        .set_title("Load CD-ROM disc")
-                        .add_filter("ISO images", &["iso", "chd"])
-                        .add_filter("All", &["*"])
-                        .pick_file()
-                    {
-                        let path_str = path.to_string_lossy().into_owned();
-                        match scsi.load_disc(id, path_str.clone()) {
-                            Ok(_) => {
-                                let filename = path.file_name()
-                                    .map(|n| n.to_string_lossy().into_owned())
-                                    .unwrap_or_else(|| path_str.clone());
-                                eprintln!("SCSI #{}: loaded {}", id, filename);
+                    // Run the picker on its own thread rather than inline.
+                    //
+                    // A native file dialog pumps its **own modal message loop**,
+                    // and on Windows that re-enters our window procedure while
+                    // winit is still inside this event callback — the same
+                    // re-entrancy that makes off-thread resizing fatal (see
+                    // `ResizeRequest`), since winit's Windows `EventLoopRunner`
+                    // keeps its handler and buffer in unsynchronised
+                    // `Cell`/`RefCell`. Meanwhile the REX3 thread keeps
+                    // presenting frames and queueing resize requests into that
+                    // same runner.
+                    //
+                    // Off-thread it can neither re-enter the event loop nor
+                    // stall emulation while the dialog sits open.
+                    // `Wd33c93a::load_disc` takes `&self` and locks internally,
+                    // so calling it from here is safe.
+                    let scsi = scsi.clone();
+                    std::thread::Builder::new()
+                        .name("cdrom-picker".to_string())
+                        .spawn(move || {
+                            let Some(path) = rfd::FileDialog::new()
+                                .set_title("Load CD-ROM disc")
+                                .add_filter("ISO images", &["iso", "chd"])
+                                .add_filter("All", &["*"])
+                                .pick_file()
+                            else { return };
+
+                            let path_str = path.to_string_lossy().into_owned();
+                            match scsi.load_disc(id, path_str.clone()) {
+                                Ok(_) => {
+                                    let filename = path.file_name()
+                                        .map(|n| n.to_string_lossy().into_owned())
+                                        .unwrap_or_else(|| path_str.clone());
+                                    eprintln!("SCSI #{}: loaded {}", id, filename);
+                                }
+                                Err(e) => eprintln!("SCSI #{}: {}", id, e),
                             }
-                            Err(e) => {
-                                eprintln!("SCSI #{}: {}", id, e);
-                            }
-                        }
-                    }
+                        })
+                        .expect("failed to spawn cdrom-picker thread");
                 } else {
                     eprintln!("No CD-ROM drive attached");
                 }
@@ -1091,6 +1142,21 @@ impl ApplicationHandler for UiApp {
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         let Some(req) = self.resize_request.lock().take() else { return };
 
+        // Fullscreen is a mode change, not a resize, so it is handled before
+        // the "don't resize while fullscreen" guard below — that guard would
+        // otherwise swallow every request to *leave* fullscreen. The window
+        // manager sends a Resized event of its own afterwards, which
+        // re-establishes window_size/last_win_size, so nothing to publish here.
+        if req == ResizeRequest::ToggleFullscreen {
+            let new_mode = if self.window.fullscreen().is_some() {
+                None
+            } else {
+                Some(winit::window::Fullscreen::Borderless(None))
+            };
+            self.window.set_fullscreen(new_mode);
+            return;
+        }
+
         // A resize is meaningless while fullscreen or maximized — the window
         // manager owns the size — and applying one would fight it.
         if self.window.fullscreen().is_some() || self.window.is_maximized() {
@@ -1104,6 +1170,8 @@ impl ApplicationHandler for UiApp {
                 if dw == 0 || dh == 0 { return; }
                 (dw * s, (dh + STATUS_BAR_HEIGHT as u32) * s)
             }
+            // Handled above; listed so a new variant is a compile error here.
+            ResizeRequest::ToggleFullscreen => return,
         };
         if w == 0 || h == 0 { return; }
 

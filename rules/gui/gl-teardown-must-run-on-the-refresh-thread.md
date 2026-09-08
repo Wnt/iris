@@ -40,12 +40,20 @@ preserved because `Rex3::stop()` joins the refresh thread, so teardown still fin
 before `stop()` returns. After a `reset`, `restart_peripherals()` calls
 `rex3.start()`, which respawns the refresh thread; `present()` then re-inits GL lazily.
 
-## Still open (same root cause, different trigger)
+## Second trigger, same root cause — FIXED
 
-`disp compositor <gl|sw>` → `GlRenderer::switch_compositor` (ui.rs) calls
-`compositor.destroy(&state.gl)` directly on the **monitor** thread. Same foreign-thread
-GL teardown, same fault; rarely triggered. A proper fix routes the compositor swap
-through the refresh thread (e.g. a pending-request flag the loop services).
+`disp compositor <gl|sw>` → `GlRenderer::switch_compositor` (ui.rs) used to call
+`compositor.destroy(&state.gl)` directly on the **monitor/CI socket** thread
+(commands are dispatched per-connection, see `ci.rs`). Same foreign-thread GL
+teardown, same fault; rarely triggered because it needs a manual monitor command.
+
+Fixed as this file prescribed: `switch_compositor` now only records the request in
+`pending_compositor: Arc<Mutex<Option<bool>>>` and returns the name the swap will
+settle on. `present()` services it via `apply_pending_compositor()` at the top of the
+frame — on the refresh thread, with the context current — before taking its `state`
+borrow. `switch_compositor` also now clamps `use_gl` against `gl_tier`, so asking for
+`gl` on a Legacy (GL 2.1) context correctly reports `sw` instead of claiming a
+compositor that `GlCompositor::new()` can't back.
 
 ## Rule of thumb
 
