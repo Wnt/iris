@@ -277,7 +277,12 @@ nokhwa = { version = "0.10", features = ["input-msmf"], optional = true }
 # Win32_System_Threading. It used to arrive by feature unification from rfd /
 # socket2 / anstyle-wincon; declare it so the Windows build doesn't depend on
 # who else happens to be in the graph.
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_Memory", "Win32_System_SystemInformation", "Win32_Security"] }
+# crash_diag.rs installs a vectored exception handler + unhandled-exception
+# filter (Win32_System_Diagnostics_Debug: AddVectoredExceptionHandler,
+# SetUnhandledExceptionFilter, RtlCaptureStackBackTrace, EXCEPTION_POINTERS) and
+# resolves stack frames to module+offset (Win32_System_LibraryLoader:
+# GetModuleHandleExW / GetModuleFileNameW).
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_Memory", "Win32_System_SystemInformation", "Win32_Security", "Win32_System_Diagnostics_Debug", "Win32_System_Kernel", "Win32_System_LibraryLoader"] }
 
 [target.'cfg(not(windows))'.dependencies]
 libc = "0.2"

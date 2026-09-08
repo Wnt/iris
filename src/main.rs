@@ -2,6 +2,12 @@ use iris::config::load_config;
 use iris::machine::Machine;
 
 fn main() {
+    // Turn a silent death (exit 0xC000041D and friends) into iris-crash.log.
+    // Cheap: dormant until something actually crashes. See the module docs.
+    iris::crash_diag::install();
+    if let Ok(kind) = std::env::var("IRIS_CRASH_SELFTEST") {
+        iris::crash_diag::selftest(&kind);
+    }
     print_build_features();
 
     // `mut` is only used by the pcap interface prompt below.

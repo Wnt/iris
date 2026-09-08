@@ -254,6 +254,7 @@ pub mod jitv2_html_default;
 #[cfg(all(feature = "jitv2", feature = "j2wp"))]
 pub mod jitv2_html_j2wp;
 pub mod jit_feedback;
+pub mod crash_diag;
 
 #[cfg(test)]
 mod platform_profile_tests;
