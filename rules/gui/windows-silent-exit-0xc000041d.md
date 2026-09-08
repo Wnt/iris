@@ -116,16 +116,31 @@ iris does `SetPixelFormat` + the first `wglMakeCurrent` (via glutin's
 state is populated → null deref. AMD's ICD is historically the worst offender
 for this cross-thread setup race.
 
-## Fix direction
+## Fix
 
-Establish the drawable fully on the **main thread, before `Ui::run` starts the
-event loop** (no messages are being pumped yet, so the AMD hook can't fire
-mid-setup): create the `Surface` and do the first `make_current` in `Ui::new`,
-then `make_not_current()` and hand both the `NotCurrentContext` and the
-`Surface` to `GlRenderer`. `ensure_init` on the REX3 thread then only
-re-`make_current`s on its own thread — the "moving a context between threads"
-pattern, which WGL explicitly supports. Rendering stays on REX3; only the
-one-time pixel-format + initial bind moves. (The macOS main-thread
-`window_handle()` constraint is already satisfied — the handle is captured in
-`Ui::new` — so this is compatible with
-`rules/macos/winit-030-window-handle-main-thread-only.md`.)
+`Ui::new()` (main thread, before `Ui::run` starts pumping messages) now builds
+the window `Surface` and binds the context to it once — `make_current` then
+`make_not_current` — and hands both the `NotCurrentContext` and the `Surface`
+to `GlRenderer` (`initial_surface: Option<Surface<WindowSurface>>`). That first
+`make_current` is what installs the ICD's window subclass and populates its
+per-HWND state, so by the time the event loop runs and a resize can reach the
+subclass, the driver state exists.
+
+`ensure_init()` on the REX3 thread consumes `initial_surface` on the true first
+frame and only `make_current`s it on its own thread — the "move a context
+between threads" handoff, which WGL supports. Rendering stays entirely on REX3;
+only the one-time pixel-format + initial bind moved.
+
+After a `stop()`/`start()` cycle (jitcheck checkpoint restore, `reset`,
+snapshot load) `initial_surface` is already `None` — `ensure_init` then makes a
+fresh surface on the refresh thread, as before. Safe by then: the pixel format
+is already set on the HWND and the driver's window state was established at
+startup, so a resize hitting the subclass is a read of valid state, not a null
+deref.
+
+macOS/Linux: unaffected or improved. The macOS `window_handle()` main-thread
+constraint was already satisfied (handle captured in `Ui::new` —
+`rules/macos/winit-030-window-handle-main-thread-only.md`); Linux/GLX moving
+`create_window_surface` + first `make_current` onto the window-creating thread
+lines up with the proprietary-NVIDIA concern noted on the
+`not_current_context` field.

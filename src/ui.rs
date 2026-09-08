@@ -96,6 +96,17 @@ struct GlRenderer {
     // that validate against the drawable/FBConfig being issued from a thread
     // other than the one that created the X11 connection/window.
     not_current_context: Option<NotCurrentContext>,
+    // The window surface, also built on the main thread in Ui::new() and bound
+    // once there (make_current → make_not_current) before the event loop runs.
+    // On Windows that first bind is what installs the GL ICD's window subclass
+    // and populates its per-HWND state; doing it lazily on the refresh thread
+    // while the event loop is already dispatching a startup resize raced the
+    // half-initialised driver (AMD atio6axx.dll null read — issue #94).
+    // `ensure_init()` consumes this on the true first frame; on a stop()/start()
+    // respawn it is already `None` and a fresh surface is made on the refresh
+    // thread (safe by then — the driver's window state exists).
+    // See rules/gui/windows-silent-exit-0xc000041d.md.
+    initial_surface: Option<Surface<WindowSurface>>,
     // Captured on the main thread in Ui::new(): winit 0.30 macOS returns
     // HandleError::Unavailable from window_handle() on any other thread, and
     // init_gl() runs on the refresh thread.
@@ -170,17 +181,24 @@ impl GlRenderer {
         let not_current_gl_context = self.not_current_context.take()
             .expect("GL context missing on the true first ensure_init() call — construction bug in Ui::new()");
 
-        let size = self.window.inner_size();
-        let attrs = SurfaceAttributesBuilder::<WindowSurface>::new().build(
-            self.raw_window_handle,
-            NonZeroU32::new(size.width.max(1)).unwrap(),
-            NonZeroU32::new(size.height.max(1)).unwrap(),
-        );
-        let gl_surface = unsafe {
-            gl_display
-                .create_window_surface(&self.gl_config, &attrs)
-                .unwrap()
-        };
+        // Normal boot: the surface was created and bound once on the main
+        // thread in Ui::new() — reuse it. Only after a stop()/start() cycle
+        // (jitcheck checkpoint restore, `reset`, snapshot load) is it already
+        // gone, and then a fresh one on this thread is fine: the driver's
+        // per-HWND GL state was established at startup.
+        let gl_surface = self.initial_surface.take().unwrap_or_else(|| {
+            let size = self.window.inner_size();
+            let attrs = SurfaceAttributesBuilder::<WindowSurface>::new().build(
+                self.raw_window_handle,
+                NonZeroU32::new(size.width.max(1)).unwrap(),
+                NonZeroU32::new(size.height.max(1)).unwrap(),
+            );
+            unsafe {
+                gl_display
+                    .create_window_surface(&self.gl_config, &attrs)
+                    .unwrap()
+            }
+        });
 
         let gl_context = not_current_gl_context.make_current(&gl_surface).unwrap();
 
@@ -801,6 +819,39 @@ impl Ui {
             .expect("failed to create a GL context under any requested version/profile");
         eprintln!("iris: using GL tier {:?}", gl_tier);
 
+        // Build the window surface and bind the context to it *once, here* — on
+        // the main thread that owns the window, before `Ui::run` starts pumping
+        // messages. This is the one GL step that must not happen lazily on the
+        // refresh thread: `create_window_surface` sets the pixel format (which
+        // makes the Windows GL ICD subclass the window) and the first
+        // `make_current` populates the driver's per-HWND state. Doing that while
+        // the event loop is already delivering a startup resize left the AMD ICD
+        // dereferencing a null pointer inside its wndproc hook (issue #94).
+        // Rendering stays entirely on the refresh thread — only this bind moves.
+        let (not_current_context, initial_surface) = {
+            let sz = window.inner_size();
+            let attrs = SurfaceAttributesBuilder::<WindowSurface>::new().build(
+                raw_window_handle,
+                NonZeroU32::new(sz.width.max(1)).unwrap(),
+                NonZeroU32::new(sz.height.max(1)).unwrap(),
+            );
+            let surface = unsafe {
+                gl_display
+                    .create_window_surface(&gl_config, &attrs)
+                    .expect("failed to create the GL window surface on the main thread")
+            };
+            let current = not_current_context
+                .make_current(&surface)
+                .expect("failed to make the GL context current during init");
+            // Hand the context straight back to `NotCurrentContext` so the
+            // refresh thread can `make_current` it on its own thread (a GL
+            // context is current on at most one thread at a time).
+            let not_current = current
+                .make_not_current()
+                .expect("failed to release the GL context after init");
+            (not_current, surface)
+        };
+
         let window_size    = Arc::new(Mutex::new(None));
         let resize_request = Arc::new(Mutex::new(None));
         // Seed with the Indy's default 1280×1024; the render thread republishes
@@ -820,6 +871,7 @@ impl Ui {
             window:      window.clone(),
             gl_config,
             not_current_context: Some(not_current_context),
+            initial_surface: Some(initial_surface),
             raw_window_handle,
             gl_tier,
             window_size: window_size.clone(),
