@@ -222,6 +222,9 @@ pub mod disp;
 pub mod exp;
 pub mod gdb_stub;
 pub mod snapshot;
+/// kernel-hive: the station reset plane (mamectl/1 SAVEST/LOADST/RESET).
+#[cfg(unix)]
+pub mod kh_ctl;
 pub mod sgi_vh;
 pub mod elf;
 pub mod chunk_store;

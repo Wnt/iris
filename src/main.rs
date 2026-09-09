@@ -116,6 +116,26 @@ fn main() {
     }
 
     machine.start();
+
+    // kernel-hive RESET plane (stream D). Two knobs, both no-ops when unset,
+    // so with neither set this binary is byte-behaviourally upstream:
+    //   IRIS_KH_CTL_SOCK  bind a mamectl/1 socket serving SAVEST/LOADST/
+    //                     RESET/FBSYNC (stream C's input listener will carry
+    //                     these verbs instead — see src/kh_ctl.rs MERGE HOOK)
+    //   IRIS_STATE=<name> restore that snapshot at startup instead of cold
+    //                     booting; empty/unset = cold boot, the rollback lever
+    #[cfg(unix)]
+    {
+        let mptr: *mut iris::machine::Machine = &mut *machine;
+        // SAFETY: `machine` outlives the process (main parks below), which is
+        // the same guarantee `iris::ci::start_server` is given above.
+        if let Err(e) = unsafe { iris::kh_ctl::start_server(mptr) } {
+            eprintln!("iris: kh_ctl: {}", e);
+            std::process::exit(1);
+        }
+        iris::kh_ctl::startup_restore(&mut machine);
+    }
+
     if !ci_enabled {
         std::thread::spawn(|| {
             Machine::run_console_client();
