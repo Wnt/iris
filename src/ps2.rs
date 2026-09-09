@@ -917,7 +917,7 @@ impl Device for Ps2Controller {
     fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
-        vec![("ps2".to_string(), "PS/2 commands: ps2 debug <on|off> | ps2 type <ascii> | ps2 enter | ps2 status".to_string())]
+        vec![("ps2".to_string(), "PS/2 commands: ps2 debug <on|off> | ps2 type <ascii> | ps2 enter | ps2 mouse <dx> <dy> [buttons] [repeat] | ps2 status".to_string())]
     }
 
     fn execute_command(&self, cmd: &str, args: &[&str], mut writer: Box<dyn Write + Send>) -> Result<(), String> {
@@ -953,6 +953,23 @@ impl Device for Ps2Controller {
                 writeln!(writer, "PS/2: pressed Enter").unwrap();
                 return Ok(());
             }
+            // kernel-hive: the monitor console could inject keys but not
+            // mouse, so a headless bring-up rig had no way to reach a menu —
+            // and "the framebuffer is the only proof" (AGENTS.md rule 9) means
+            // a reset proof needs a pointer to dirty the screen with. Deltas
+            // are host-paced by the caller; this is a debug lever, not the
+            // station's input plane (that is the mamectl/1 socket).
+            if !args.is_empty() && args[0] == "mouse" {
+                let dx: i32 = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(0);
+                let dy: i32 = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(0);
+                let btn: u8 = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(0);
+                let n: usize = args.get(4).and_then(|v| v.parse().ok()).unwrap_or(1);
+                for _ in 0..n.max(1) {
+                    self.push_mouse_input(btn, dx, dy, 0);
+                }
+                writeln!(writer, "PS/2: mouse dx={} dy={} buttons={:#04x} x{}", dx, dy, btn, n.max(1)).unwrap();
+                return Ok(());
+            }
             if !args.is_empty() && args[0] == "status" {
                 let s = self.state.lock();
                 writeln!(writer, "PS/2 state: running={} scanning_enabled={} mouse_enabled={} mouse_id={} rx_queue_len={} mouse_queue_bytes={} scancode_set={} config={:02x} last_read={:02x}",
@@ -961,7 +978,7 @@ impl Device for Ps2Controller {
                     s.mouse_queue_bytes, s.scancode_set, s.config, s.last_read).unwrap();
                 return Ok(());
             }
-            return Err("Usage: ps2 debug <on|off> | ps2 type <ascii> | ps2 enter | ps2 status".to_string());
+            return Err("Usage: ps2 debug <on|off> | ps2 type <ascii> | ps2 enter | ps2 mouse <dx> <dy> [buttons] [repeat] | ps2 status".to_string());
         }
         Err("Command not found".to_string())
     }
