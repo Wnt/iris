@@ -1,3 +1,13 @@
+# Pinned for kernel-hive (fork Wnt/iris, branch kh-native).
+#
+# Upstream says `channel = "nightly"`, which is a MOVING input: every rebuild
+# can pick a different compiler. In the lab the emulator binary is one third of
+# a checkpoint (golden + binary + device set are ONE combination, AGENTS.md
+# rule 6), so a floating toolchain silently orphans every saved state and makes
+# a rebuild unreproducible. Pin a date.
+#
+# nightly-2026-08-02 = rustc 1.99.0-nightly (11177f223 2026-08-02); the toolchain
+# already resident on the lab build host, so a cold build does not re-download it.
 [toolchain]
-channel = "nightly"
+channel = "nightly-2026-08-02"
 components = ["rustc", "cargo", "rust-std", "clippy", "rustfmt"]
