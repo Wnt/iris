@@ -129,6 +129,40 @@ fn main() {
         } else if ci_enabled {
             eprintln!("iris: --ci mode (REX3 rendering to offscreen buffer, no window)");
         }
+        // Host-native frame plane. Upstream installs a `rex3::Renderer` in
+        // exactly one place -- `ui.rs`, on the windowed path -- so with no
+        // window `rex3.renderer` stays `None`, `present()` is never called and
+        // the "-ci mode (REX3 rendering to offscreen buffer)" banner above is
+        // not true: nothing composites and `screen.rgba` stays zeroed.
+        //
+        // With `IRIS_SHM_PATH` set we install a renderer that composites with
+        // the same CPU `SwCompositor` and publishes each finished frame into a
+        // mapped file in IFB1 format, which is what the kernel-hive streaming
+        // daemon reads (`SH_CAPTURE=shm`). No X server, no window, no GL.
+        //
+        // Knob unset -> nothing here runs and the binary is upstream. Knob set
+        // but unusable -> exit loudly: a station that cannot publish frames
+        // must refuse to start rather than stream a black screen, because a
+        // dead frame plane and a wedged guest look identical from outside.
+        match machine.get_rex3() {
+            Some(rex3) => match iris::shmpub::install(&rex3) {
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("iris: {}={:?}: {}", iris::shmpub::ENV_PATH,
+                              std::env::var(iris::shmpub::ENV_PATH).ok(), e);
+                    std::process::exit(1);
+                }
+            },
+            None => {
+                if std::env::var(iris::shmpub::ENV_PATH).map(|v| !v.is_empty()).unwrap_or(false) {
+                    eprintln!("iris: {} is set but there is no REX3 to capture -- \
+--headless omits the graphics board entirely; use --ci instead",
+                              iris::shmpub::ENV_PATH);
+                    std::process::exit(1);
+                }
+            }
+        }
+
         // Park the main thread so background threads (CPU, REX3 refresh,
         // CI socket) keep running. `quit` via the CI socket calls
         // std::process::exit.

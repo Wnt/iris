@@ -210,6 +210,7 @@ pub mod ui;
 pub mod rex3;
 pub mod rex3_simd;
 pub mod compositor;
+pub mod shmpub;
 pub mod gl_compositor;
 pub mod headless_gl;
 pub mod debug_overlay;
