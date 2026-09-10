@@ -113,6 +113,33 @@ use crate::vc2::{VC2_REG_CURRENT_CURSOR_X, VC2_REG_CURSOR_Y_LOC};
 
 pub const PROTO_ID: &str = "mamectl/1";
 
+// ---------------------------------------------------------------------------
+// the machine pointer — one socket, all the verbs
+// ---------------------------------------------------------------------------
+
+/// The `Machine` this listener drives, carried so the engine thread can hand
+/// the lifecycle verbs (`SAVEST` / `LOADST` / `RESET` / `FBSYNC` / `CKPT`) to
+/// [`crate::kh_ctl`].
+///
+/// WHY IT LIVES HERE. `mame_sock.rs` gives a station exactly ONE control
+/// socket (`SH_MAMECTL_SOCK`), and `scripts/serve/reset-tile.sh` sends
+/// `LOADST golden` down that same socket the browser's pointer rides. Two
+/// listeners would mean two sockets and a station that can be driven or reset
+/// but not both, so this module owns the socket and `kh_ctl` owns the verbs:
+/// the merge hook `kh_ctl` documents at its module top, taken.
+///
+/// Routing them through the ENGINE thread rather than the connection thread is
+/// the point of the seam. The engine is the single applier of keys, buttons and
+/// pointer counts, so a `LOADST` can never interleave with a half-drained
+/// MOVEA burst — it is applied in wire order with everything ahead of it,
+/// which is exactly what an `OK` promises the daemon.
+struct MachinePtr(*mut Machine);
+// SAFETY: the pointer is valid for the process lifetime (`main` parks after
+// handing it over) and is dereferenced ONLY on the engine thread, which is the
+// single applier for this module.
+unsafe impl Send for MachinePtr {}
+unsafe impl Sync for MachinePtr {}
+
 /// The one port name this module accepts in `KEY <0|1> <port> <field>`.
 /// Iris's keyboard is not a matrix, so there is exactly one.
 pub const KBD_PORT: &str = "kbd";
@@ -357,6 +384,8 @@ struct Counters {
     btn: AtomicU64,
     errs: AtomicU64,
     gated: AtomicU64,
+    /// reset-plane verbs served on this socket (`kh_ctl`'s)
+    lifecycle: AtomicU64,
 }
 
 // ---------------------------------------------------------------------------
@@ -371,6 +400,9 @@ struct Conn {
 struct Shared {
     cfg: Cfg,
     banner: String,
+    /// The machine, for the lifecycle verbs `kh_ctl` owns. Only the engine
+    /// thread dereferences it.
+    machine: MachinePtr,
     surf_w: i32,
     surf_h: i32,
     ps2: Arc<Ps2Controller>,
@@ -492,6 +524,11 @@ pub unsafe fn start_server(
     if rex3.is_some() {
         caps.push_str(",movea,cur");
     }
+    // The reset plane rides this same socket, so it must ride this same banner:
+    // a client that reads caps to decide whether it can reset the station has
+    // to see the truth from the one connection it makes.
+    caps.push(',');
+    caps.push_str(crate::kh_ctl::caps_fragment());
     let banner = format!(
         "HELLO {} iris-{} indy caps={} screen={}x{}\n",
         PROTO_ID,
@@ -504,6 +541,7 @@ pub unsafe fn start_server(
     let shared = Arc::new(Shared {
         cfg,
         banner,
+        machine: MachinePtr(machine_ptr),
         surf_w: w,
         surf_h: h,
         ps2,
@@ -756,6 +794,24 @@ impl Engine {
 
     // ---- injection --------------------------------------------------------
 
+    /// Forget everything this engine believes about the guest's pointer and
+    /// buttons. Called after a restore or a machine reset — see the dispatch
+    /// arm above.
+    fn forget_guest_state(&mut self) {
+        self.flight = None;
+        self.bleedq.clear();
+        self.clickq.clear();
+        self.btnq.clear();
+        self.gain = Gain::new();
+        self.last_cur = (0, 0);
+        // Buttons: the restored guest has none held. Tell the PS/2 device so
+        // its own button byte matches, then clear ours.
+        if self.buttons != 0 {
+            self.buttons = 0;
+            self.shared.ps2.push_mouse_input(0, 0, 0, 0);
+        }
+    }
+
     fn push_mouse(&self, dx: i32, dy: i32) {
         self.shared.ps2.push_mouse_input(self.buttons, dx, dy, 0);
     }
@@ -972,12 +1028,38 @@ impl Engine {
                 // SYNC ack is a real barrier.
                 self.shared.reply_ok(&ack, "");
             }
-            "PAUSE" | "RESUME" | "RESET" | "SAVEST" | "LOADST" | "FBSYNC" | "EXIT" => {
-                // Machine lifecycle verbs belong to the reset plane
-                // (kh-native-reset). Answering ERR here rather than silently
-                // OK keeps a half-wired station loud.
-                self.shared.reply_err(&ack, "badverb", verb);
+            // ---- the reset plane, on this same socket ----------------
+            // `SAVEST` `LOADST` `RESET` `FBSYNC` `CKPT` are `kh_ctl`'s, taken
+            // through the merge hook it documents. They are applied HERE, on
+            // the engine thread, so an `OK` still means "everything ahead of
+            // this line has been applied and so has this" — the property
+            // `mame_sock.rs` and `reset-tile.sh` both rely on.
+            v if crate::kh_ctl::verb_owned(v) => {
+                c.lifecycle.fetch_add(1, Ordering::Relaxed);
+                // SAFETY: the pointer is valid for the process lifetime and
+                // this is the single engine thread; every verb below stops the
+                // machine's own threads before touching state.
+                let m = unsafe { &mut *self.shared.machine.0 };
+                let reply = crate::kh_ctl::dispatch(m, v, rest);
+                // A restore rewinds the guest under us: the button mask, the
+                // learned gain and any in-flight MOVEA describe a machine that
+                // no longer exists, and steering by them would chase a cursor
+                // that jumped. Drop the flight state and re-seed from the
+                // registers on the next verb.
+                if matches!(v, "LOADST" | "RESET") {
+                    self.forget_guest_state();
+                }
+                match reply {
+                    crate::kh_ctl::Reply::Ok(d) => self.shared.reply_ok(&ack, &d),
+                    crate::kh_ctl::Reply::Err(code, text) => {
+                        self.shared.reply_err(&ack, code, &text)
+                    }
+                }
             }
+            // PAUSE / RESUME / EXIT are nobody's here: the daemon freezes this
+            // station with SIGSTOP through SH_IDLE_PAUSE_PIDFILE and stops it
+            // with the unit. Answering ERR rather than a silent OK keeps a
+            // mis-wired station loud.
             _ => self.shared.reply_err(&ack, "badverb", verb),
         }
     }
@@ -1241,7 +1323,7 @@ impl Engine {
         let (kb, ms) = self.shared.ps2.input_ready();
         format!(
             "move={} movep={} movea={} conv={} giveup={} key={} btn={} err={} gated={} \
-             cur={},{} gain={:.3},{:.3} buttons={:#04x} kq={} btnq={} kbd={} mouse={} screen={}x{} xadj={}",
+             life={} cur={},{} gain={:.3},{:.3} buttons={:#04x} kq={} btnq={} kbd={} mouse={} screen={}x{} xadj={}",
             c.move_v.load(Ordering::Relaxed),
             c.movep.load(Ordering::Relaxed),
             c.movea.load(Ordering::Relaxed),
@@ -1251,6 +1333,7 @@ impl Engine {
             c.btn.load(Ordering::Relaxed),
             c.errs.load(Ordering::Relaxed),
             c.gated.load(Ordering::Relaxed),
+            c.lifecycle.load(Ordering::Relaxed),
             self.last_cur.0,
             self.last_cur.1,
             self.gain.x,

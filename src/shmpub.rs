@@ -367,13 +367,6 @@ impl Mapping {
     fn seq_word(&self) -> &AtomicU64 {
         unsafe { &*(self.ptr.add(24) as *const AtomicU64) }
     }
-
-    /// One row of pixels in the mapping, as bytes.
-    fn row_mut(&self, y: usize) -> &mut [u8] {
-        unsafe {
-            std::slice::from_raw_parts_mut(self.ptr.add(HEADER + y * self.stride), self.stride)
-        }
-    }
 }
 
 /// The `Renderer` that composites and publishes. One per process, owned by

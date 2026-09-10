@@ -4379,6 +4379,14 @@ impl Rex3 {
         self.load_framebuffers_named(dir, "rex3")
     }
 
+    /// Visible display geometry as VC2 currently decodes it (kernel-hive:
+    /// the `mamectl/1` HELLO banner states the surface a client may clamp to,
+    /// and the reset plane needs it without reaching into `screen`).
+    pub fn display_size(&self) -> (usize, usize) {
+        let s = self.screen.lock();
+        (s.width, s.height)
+    }
+
     /// Dump the full 2048x1024 VRAM for offline inspection: raw rgb/aux/did
     /// planes plus ci.png (low 8 bits of rgb) and rgb.png (full 24-bit rgb).
     /// Unlike `save_framebuffers_named`, this also captures the decoded DID

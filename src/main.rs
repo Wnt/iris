@@ -90,6 +90,7 @@ fn main() {
     // already talks to MAME and to `Wnt/previous`. Gated on IRIS_CTL_SOCK, and
     // deliberately NOT on --ci: the station wants the input plane without the
     // ci socket's per-pid /tmp COW overlay redirect or its SCC replacement.
+    #[cfg(unix)]
     let _ctl_server = match std::env::var("IRIS_CTL_SOCK") {
         Ok(path) if !path.trim().is_empty() => {
             let mptr: *mut iris::machine::Machine = &mut *machine;
@@ -138,43 +139,44 @@ fn main() {
         iris::gdb_stub::start_gdb_server(port, cpu_debug);
     }
 
-    machine.start();
-    if !ci_enabled {
-        std::thread::spawn(|| {
-            Machine::run_console_client();
-        });
-    }
-
     // `--no-window` skips the window and NOTHING else; `--ci` also skips it, but
     // as a side effect of a mode that swaps the serial backends and redirects
     // every COW overlay into /tmp per pid. A streaming host wants the first.
     let show_window = !headless && !no_window && !(ci_enabled && !ci_display);
+
+    // Host-native frame plane, INSTALLED BEFORE THE CPU RUNS. Upstream installs
+    // a `rex3::Renderer` in exactly one place -- `ui.rs`, on the windowed path
+    // -- so with no window `rex3.renderer` stays `None`, `present()` is never
+    // called and the "--ci mode (REX3 rendering to offscreen buffer)" banner is
+    // not true: nothing composites and `screen.rgba` stays zeroed.
+    //
+    // With `IRIS_SHM_PATH` set we install a renderer that composites with the
+    // same CPU `SwCompositor` and publishes each finished frame into a mapped
+    // file in IFB1 format, which is what the kernel-hive streaming daemon reads
+    // (`SH_CAPTURE=shm`). No X server, no window, no GL.
+    //
+    // ORDER MATTERS, and this is why it is here rather than after `start()`:
+    // the startup restore below calls `kh_ctl::fbsync()` so the reader is never
+    // left showing the pre-restore picture (`shmpub`'s stale-page trap), and a
+    // hook that is registered afterwards would not be called at all. Installing
+    // a renderer into an idle REX3 costs nothing; the first `present()` still
+    // comes from the refresh loop `machine.start()` spins up.
+    //
+    // Knob unset -> nothing here runs and the binary is upstream. Knob set but
+    // unusable -> exit loudly: a station that cannot publish frames must refuse
+    // to start rather than stream a black screen, because a dead frame plane
+    // and a wedged guest look identical from outside.
+    #[cfg(unix)]
     if !show_window {
-        if headless {
-            eprintln!("iris: running headless (no REX3, no window)");
-        } else if no_window {
-            eprintln!("iris: --no-window (REX3 alive, no host window)");
-        } else if ci_enabled {
-            eprintln!("iris: --ci mode (REX3 rendering to offscreen buffer, no window)");
-        }
-        // Host-native frame plane. Upstream installs a `rex3::Renderer` in
-        // exactly one place -- `ui.rs`, on the windowed path -- so with no
-        // window `rex3.renderer` stays `None`, `present()` is never called and
-        // the "-ci mode (REX3 rendering to offscreen buffer)" banner above is
-        // not true: nothing composites and `screen.rgba` stays zeroed.
-        //
-        // With `IRIS_SHM_PATH` set we install a renderer that composites with
-        // the same CPU `SwCompositor` and publishes each finished frame into a
-        // mapped file in IFB1 format, which is what the kernel-hive streaming
-        // daemon reads (`SH_CAPTURE=shm`). No X server, no window, no GL.
-        //
-        // Knob unset -> nothing here runs and the binary is upstream. Knob set
-        // but unusable -> exit loudly: a station that cannot publish frames
-        // must refuse to start rather than stream a black screen, because a
-        // dead frame plane and a wedged guest look identical from outside.
         match machine.get_rex3() {
             Some(rex3) => match iris::shmpub::install(&rex3) {
-                Ok(_) => {}
+                Ok(true) => {
+                    // The reset plane's `FBSYNC`, and every restore it runs,
+                    // republishes one whole frame through this hook.
+                    #[cfg(unix)]
+                    iris::kh_ctl::set_fbsync_hook(Box::new(iris::shmpub::request_fbsync));
+                }
+                Ok(false) => {}
                 Err(e) => {
                     eprintln!("iris: {}={:?}: {}", iris::shmpub::ENV_PATH,
                               std::env::var(iris::shmpub::ENV_PATH).ok(), e);
@@ -190,7 +192,40 @@ fn main() {
                 }
             }
         }
+    }
 
+    machine.start();
+
+    // kernel-hive RESET plane (stream D), on the ONE control socket the input
+    // plane already bound: `src/ctlsock.rs` routes `SAVEST` / `LOADST` /
+    // `RESET` / `FBSYNC` / `CKPT` to `kh_ctl::dispatch` from its engine thread.
+    // There is no second socket and no `IRIS_KH_CTL_SOCK` — streamhost gives a
+    // station exactly one `SH_MAMECTL_SOCK`, and `reset-tile.sh` sends
+    // `LOADST golden` down the same one the browser's pointer rides.
+    //
+    // `IRIS_STATE=<name>` restores that snapshot instead of cold booting;
+    // empty or unset = cold boot, which is the rollback lever. It runs AFTER
+    // `machine.start()` on purpose: restoring into a machine that has never
+    // executed an instruction reproduces the dead-input state this plane had to
+    // fix (see `kh_ctl`), so it waits for the guest to reach a real milestone
+    // first — VC2 having decoded a display mode — never a guessed sleep.
+    #[cfg(unix)]
+    iris::kh_ctl::startup_restore(&mut machine);
+
+    if !ci_enabled {
+        std::thread::spawn(|| {
+            Machine::run_console_client();
+        });
+    }
+
+    if !show_window {
+        if headless {
+            eprintln!("iris: running headless (no REX3, no window)");
+        } else if no_window {
+            eprintln!("iris: --no-window (REX3 alive, no host window)");
+        } else if ci_enabled {
+            eprintln!("iris: --ci mode (REX3 rendering to offscreen buffer, no window)");
+        }
         // Park the main thread so background threads (CPU, REX3 refresh,
         // CI socket) keep running. `quit` via the CI socket calls
         // std::process::exit.

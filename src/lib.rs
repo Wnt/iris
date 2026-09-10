@@ -206,11 +206,17 @@ pub mod scsi;
 pub mod wd33c93a;
 pub mod hal2;
 pub mod ps2;
+/// kernel-hive: the host-native station INPUT plane (mamectl/1), which also
+/// carries `kh_ctl`'s reset verbs. Unix sockets, so unix only.
+#[cfg(unix)]
 pub mod ctlsock;
 pub mod ui;
 pub mod rex3;
 pub mod rex3_simd;
 pub mod compositor;
+/// kernel-hive: the host-native station FRAME plane (IFB1 into a mapped file).
+/// mmap, so unix only.
+#[cfg(unix)]
 pub mod shmpub;
 pub mod gl_compositor;
 pub mod headless_gl;
@@ -224,6 +230,9 @@ pub mod disp;
 pub mod exp;
 pub mod gdb_stub;
 pub mod snapshot;
+/// kernel-hive: the station reset plane (mamectl/1 SAVEST/LOADST/RESET).
+#[cfg(unix)]
+pub mod kh_ctl;
 pub mod sgi_vh;
 pub mod elf;
 pub mod chunk_store;

@@ -469,8 +469,24 @@ impl Machine {
             } else {
                 (dev.path.clone(), vec![])
             };
-            let result = if ci_enabled && dev.overlay && !dev.cdrom {
-                let ci_overlay = format!("/tmp/iris-ci-{}-scsi{}.overlay", ci_pid, id);
+            // kernel-hive (stream D, reset plane): `--ci` redirects a COW
+            // overlay to a throwaway /tmp file keyed by pid, which is right
+            // for a CI run and wrong for an exhibit — a station would lose
+            // every guest write on restart and put multi-GB of dirty sectors
+            // on the host's tmpfs. Two knobs make the station's overlay
+            // deliberate instead of inherited:
+            //   IRIS_CI_OVERLAY=inherit    use the configured `<path>.overlay`
+            //   IRIS_CI_OVERLAY_DIR=<dir>  use `<dir>/scsi<N>.overlay`
+            // Unset = upstream behaviour, byte-for-byte.
+            let kh_overlay_mode = std::env::var("IRIS_CI_OVERLAY").unwrap_or_default();
+            let kh_overlay_dir = std::env::var("IRIS_CI_OVERLAY_DIR").unwrap_or_default();
+            let kh_inherit = kh_overlay_mode == "inherit";
+            let result = if ci_enabled && dev.overlay && !dev.cdrom && !kh_inherit {
+                let ci_overlay = if kh_overlay_dir.is_empty() {
+                    format!("/tmp/iris-ci-{}-scsi{}.overlay", ci_pid, id)
+                } else {
+                    format!("{}/scsi{}.overlay", kh_overlay_dir.trim_end_matches('/'), id)
+                };
                 hpc3.add_scsi_device_with_overlay(dev.controller, id as usize, &path, dev.cdrom, discs, dev.overlay, &ci_overlay)
             } else {
                 hpc3.add_scsi_device(dev.controller, id as usize, &path, dev.cdrom, discs, dev.overlay)
@@ -993,7 +1009,16 @@ impl Machine {
         // Monitor server on localhost:8888 — always start, even in CI mode,
         // so debug helpers (status/regs/bt/dis) stay reachable while iris-ci
         // drives the serial console.
-        self.monitor.clone().start_server("127.0.0.1:8888".to_string());
+        //
+        // kernel-hive: the address is a knob because 8888 is a PROCESS-WIDE
+        // SINGLETON on a hardcoded loopback port. Two iris instances on one
+        // host — two bring-up rigs, or a rig beside a live station — silently
+        // lose the console for the second one, and a contained station cannot
+        // expose it at all without designing the netns around it. Unset =
+        // upstream behaviour, byte for byte.
+        let monitor_addr = std::env::var("IRIS_MONITOR_ADDR")
+            .unwrap_or_else(|_| "127.0.0.1:8888".to_string());
+        self.monitor.clone().start_server(monitor_addr);
 
         // CI mode: the harness drives startup via `restore` / `start`. Don't
         // autostart the CPU so the first command finds a quiet machine.
@@ -1072,8 +1097,11 @@ impl Machine {
         println!("IRIS: {}", emulator_name());
         println!("Connecting to monitor socket...");
 
+        // kernel-hive: same knob as the server side above.
+        let monitor_addr = std::env::var("IRIS_MONITOR_ADDR")
+            .unwrap_or_else(|_| "127.0.0.1:8888".to_string());
         let mut stream = loop {
-            match TcpStream::connect("127.0.0.1:8888") {
+            match TcpStream::connect(&monitor_addr) {
                 Ok(s) => break s,
                 Err(_) => {
                     thread::sleep(std::time::Duration::from_millis(10));
@@ -1352,6 +1380,34 @@ impl Machine {
     #[cfg(feature = "developer")]
     pub fn cpu_set_hw_read_fixup_replay(&self, fixups: Option<Vec<(u64, u8, u64)>>) -> Result<(), String> {
         self.cpu.set_hw_read_fixup_replay(fixups)
+    }
+
+    /// Name of the snapshot the last `ci_restore` loaded, if any.
+    /// kernel-hive: `LOADST <name>` uses this to decide whether the ~42 ms
+    /// in-memory `ci_rollback` describes the SAME snapshot the caller asked
+    /// for. Rolling back to a differently-named state would look correct and
+    /// be wrong.
+    pub fn last_restore_name(&self) -> Option<String> {
+        self.last_restore.clone()
+    }
+
+    /// Whether an in-memory rollback checkpoint is cached, i.e. whether
+    /// `ci_rollback` can run without touching the disk.
+    pub fn has_rollback_checkpoint(&self) -> bool {
+        self.last_restore_checkpoint.is_some()
+    }
+
+    /// Drop the cached in-memory rollback checkpoint, forcing the next
+    /// `ci_rollback`/`LOADST` down the disk path.
+    ///
+    /// kernel-hive: this is what a RECAPTURE must call. After `SAVEST golden`
+    /// promotes a new `saves/golden`, the cached checkpoint still describes
+    /// the state captured at the LAST restore of the old golden — so a
+    /// `LOADST golden` taking the fast in-memory path would rewind to the
+    /// previous checkpoint under the new checkpoint's name. Correct-looking
+    /// and wrong, which is the worst kind.
+    pub fn invalidate_rollback_checkpoint(&mut self) {
+        self.last_restore_checkpoint = None;
     }
 
     /// Full rewind: load the named snapshot, which now captures the COW
