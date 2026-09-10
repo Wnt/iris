@@ -46,22 +46,36 @@
 //!    64        height * stride bytes of pixels
 //! ```
 //!
-//! ## Pixel format — no conversion happens here
+//! ## Pixel format — one channel swap, and it was measured, not reasoned
 //!
 //! `SwCompositor`'s final store (`compositor.rs`) is
-//! `buf[i] = 0xFF000000 | (r << 16) | (g << 8) | b`, i.e. the word is
-//! `0xFFRRGGBB`, which on x86 is **B, G, R, X in memory** — byte-identical to
-//! the BGRA the encoder wants and to MAME's `bitmap_rgb32`. At 1280x1024 a
-//! per-pixel swap would be 1.3 M shuffles every frame, so it matters that there
-//! is none.
+//! `buf[i] = 0xFF000000 | (r << 16) | (g << 8) | b`. Read naively that says
+//! the word is `0xFFRRGGBB`, i.e. B,G,R,X in memory, which is exactly what the
+//! consumer wants — so this publisher was first written with no conversion at
+//! all.
 //!
-//! Two places in the tree say otherwise and are simply wrong: `disp.rs`'s
-//! `save_screenshot` comment claims `0xFFBBGGRR` and its encoder pushes the
-//! BLUE byte as the PNG's red channel (the RCtrl+PrintScreen path has R and B
-//! swapped upstream), and `SwCompositor::pixels`' doc comment repeats the same
-//! claim. `ci.rs`'s encoder is the correct one. This was confirmed on a real
-//! frame, not taken on faith: IRIX's 4Dwm desktop is teal, and a swapped
-//! channel turns it orange.
+//! **That is wrong, and the framebuffer said so.** The variables in that
+//! expression are mis-named: what the compositor calls `r` carries blue all
+//! the way through, so the word is `0xFFBBGGRR` and memory order is
+//! **R, G, B, X**. Measured on the first published frame of an IRIX 6.5 boot:
+//! the SGI background gradient came out orange instead of its blue, and a raw
+//! sample at (20,20) read `AE CF FC FF` — (174, 207, 252) as R,G,B, a pale
+//! blue, and nonsense the other way round.
+//!
+//! The layout is not a bug: the windowed GL path uploads that buffer as
+//! `glow::RGBA`, and `iris-gui`'s `Frame` documents "Pixel order: R, G, B, A"
+//! for the same bytes. Both agree with R,G,B,X. So the compositor stays as it
+//! is and the swap happens here, on the way into the mapping — the one place
+//! that actually wants B,G,R,X.
+//!
+//! It costs ~4 integer ops per pixel on rows that changed, and rows that did
+//! not change are not touched at all (see Damage below), so an idle desktop
+//! pays nothing. The upstream defect this DOES confirm is real:
+//! `disp.rs::save_screenshot` (the RCtrl+PrintScreen path) pushes `px & 0xFF`
+//! as the PNG's red channel, which for a `0xFFBBGGRR` word is the red byte and
+//! therefore correct — while its own comment claims the opposite. `ci.rs`'s
+//! encoder agrees with `save_screenshot`. Both are right; only the comments
+//! lie.
 //!
 //! ## Synchronisation
 //!
@@ -189,6 +203,14 @@ pub fn install(rex3: &Arc<Rex3>) -> std::io::Result<bool> {
     Ok(true)
 }
 
+/// `0xFFBBGGRR` (compositor, R,G,B,X in memory) -> `0xFFRRGGBB` (IFB1, B,G,R,X
+/// in memory). Green and the pad byte stay put; red and blue trade places.
+/// Written as plain integer arithmetic so LLVM can vectorise the row loop.
+#[inline(always)]
+fn swap_rb(w: u32) -> u32 {
+    (w & 0xFF00_FF00) | ((w & 0x00FF_0000) >> 16) | ((w & 0x0000_00FF) << 16)
+}
+
 /// A live read-write mapping of the published file, sized from the geometry it
 /// currently carries.
 struct Mapping {
@@ -297,6 +319,10 @@ pub struct ShmPublisher {
     /// an `FBSYNC`: the next publish writes every row and claims the whole
     /// frame as dirty.
     force_full: bool,
+    /// Our copy of the COMPOSITOR's last published pixels (tightly packed,
+    /// UNSWAPPED). Diffing against this rather than against the mapping keeps
+    /// an unchanged row down to one `memcmp`.
+    shadow: Vec<u32>,
     seq: u64,
 }
 
@@ -313,6 +339,7 @@ impl ShmPublisher {
             compositor: SwCompositor::new(),
             derive_damage,
             force_full: true,
+            shadow: Vec::new(),
             seq: 0,
         })
     }
@@ -395,23 +422,37 @@ impl Renderer for ShmPublisher {
         // Copy only rows that actually changed, and let the same pass tell us
         // the dirty band. The mapping is persistent: an unchanged row is already
         // correct in the file. `dirty_y1` is exclusive.
+        //
+        // The comparison is against our own shadow of the COMPOSITOR's pixels,
+        // not against the mapping, so an unchanged row costs one `memcmp` and
+        // never pays for the channel swap.
         let full = self.force_full || !self.derive_damage;
+        if self.shadow.len() != width * height {
+            self.shadow.resize(width * height, 0);
+        }
         let mut first: Option<usize> = None;
         let mut last: usize = 0;
 
         map.seq_word().store(self.seq | 1, Ordering::Release);
         for y in 0..height {
             let src_row = &pixels[y * COMPOSITOR_STRIDE..y * COMPOSITOR_STRIDE + width];
-            // SAFETY: `row_mut` is inside our own private mapping; the borrow
-            // does not outlive this iteration and no other thread writes it.
-            let dst_row = map.row_mut(y);
-            let src_bytes = unsafe {
-                std::slice::from_raw_parts(src_row.as_ptr() as *const u8, width * 4)
-            };
-            if !full && dst_row == src_bytes {
+            let sh_row = &mut self.shadow[y * width..(y + 1) * width];
+            if !full && sh_row == src_row {
                 continue;
             }
-            dst_row.copy_from_slice(src_bytes);
+            sh_row.copy_from_slice(src_row);
+            // SAFETY: the mapping is ours alone, `HEADER` and `stride` are both
+            // multiples of 4 so the row is u32-aligned, and the borrow does not
+            // outlive this iteration.
+            let dst_row = unsafe {
+                std::slice::from_raw_parts_mut(
+                    map.ptr.add(HEADER + y * map.stride) as *mut u32,
+                    width,
+                )
+            };
+            for (d, &sp) in dst_row.iter_mut().zip(sh_row.iter()) {
+                *d = swap_rb(sp);
+            }
             if first.is_none() {
                 first = Some(y);
             }

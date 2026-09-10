@@ -826,6 +826,10 @@ pub struct MachineConfig {
     #[serde(default)]
     pub ci_display: bool,
 
+    /// Skip the host window, changing nothing else (see the CLI flag).
+    #[serde(default)]
+    pub no_window: bool,
+
     /// Pixels of host trackpad/wheel movement that equal one PS/2 scroll
     /// detent. Lower = faster scroll; higher = slower. Default 40.
     /// Tune if scroll feels too fast or too slow on your hardware.
@@ -1001,6 +1005,7 @@ impl Default for MachineConfig {
             ci: false,
             ci_socket: default_ci_socket(),
             ci_display: false,
+            no_window: false,
             serial_log: None,
             vino: VinoConfig::default(),
             network: NetworkSection::default(),
@@ -1300,6 +1305,18 @@ pub struct Cli {
     #[arg(long, default_value_t = false)]
     pub headless: bool,
 
+    /// Skip the host window but keep REX3 fully alive, WITHOUT any of --ci's
+    /// behaviour changes. This is what a streaming host wants: the frame
+    /// publisher (IRIS_SHM_PATH) is the display, so a winit window would be
+    /// pure cost -- but --ci is the wrong way to get there, because it also
+    /// swaps the SCC serial backends and redirects every overlay=true disk to
+    /// a throwaway /tmp/iris-ci-<pid>-scsiN.overlay. That last one silently
+    /// makes EVERY launch a cold first boot, which on IRIX means paying the
+    /// ~7-minute autoconfig relink again and again. --no-window changes
+    /// nothing but the window.
+    #[arg(long = "no-window", default_value_t = false)]
+    pub no_window: bool,
+
     /// Disable audio emulation (no HAL2); graphics still works
     #[arg(long = "noaudio", default_value_t = false)]
     pub no_audio: bool,
@@ -1438,6 +1455,7 @@ impl Cli {
         if let Some(cpu) = self.cpu { cfg.machine.cpu = cpu; }
         if self.scale2x { cfg.scale = 2; }
         if self.headless  { cfg.headless  = true; }
+        if self.no_window { cfg.no_window = true; }
         if self.no_audio  { cfg.no_audio  = true; }
 
         if self.no_scsi_deferred_int { cfg.scsi_deferred_int = false; }

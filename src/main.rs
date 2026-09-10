@@ -38,6 +38,7 @@ fn main() {
     let gdb_port = cfg.gdb_port;
     let ci_enabled = cfg.ci;
     let ci_display = cfg.ci_display;
+    let no_window = cfg.no_window;
     let ci_socket_path = cfg.ci_socket.clone();
     let load_elf = cfg.load_elf.clone();
 
@@ -122,10 +123,15 @@ fn main() {
         });
     }
 
-    let show_window = !headless && !(ci_enabled && !ci_display);
+    // `--no-window` skips the window and NOTHING else; `--ci` also skips it, but
+    // as a side effect of a mode that swaps the serial backends and redirects
+    // every COW overlay into /tmp per pid. A streaming host wants the first.
+    let show_window = !headless && !no_window && !(ci_enabled && !ci_display);
     if !show_window {
         if headless {
             eprintln!("iris: running headless (no REX3, no window)");
+        } else if no_window {
+            eprintln!("iris: --no-window (REX3 alive, no host window)");
         } else if ci_enabled {
             eprintln!("iris: --ci mode (REX3 rendering to offscreen buffer, no window)");
         }
