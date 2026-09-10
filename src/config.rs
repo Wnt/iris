@@ -830,6 +830,12 @@ pub struct MachineConfig {
     #[serde(default)]
     pub no_window: bool,
 
+    /// Run the JSON-lines control socket. Implied by `ci`, but also settable on
+    /// its own by naming a socket with `--ci-socket`, so a station can have the
+    /// control plane WITHOUT `--ci`'s behaviour changes.
+    #[serde(default)]
+    pub ci_server: bool,
+
     /// Pixels of host trackpad/wheel movement that equal one PS/2 scroll
     /// detent. Lower = faster scroll; higher = slower. Default 40.
     /// Tune if scroll feels too fast or too slow on your hardware.
@@ -1006,6 +1012,7 @@ impl Default for MachineConfig {
             ci_socket: default_ci_socket(),
             ci_display: false,
             no_window: false,
+            ci_server: false,
             serial_log: None,
             vino: VinoConfig::default(),
             network: NetworkSection::default(),
@@ -1459,8 +1466,13 @@ impl Cli {
         if self.no_audio  { cfg.no_audio  = true; }
 
         if self.no_scsi_deferred_int { cfg.scsi_deferred_int = false; }
-        if self.ci         { cfg.ci         = true; }
-        if let Some(p) = &self.ci_socket { cfg.ci_socket = p.clone(); }
+        if self.ci         { cfg.ci         = true; cfg.ci_server = true; }
+        // Naming a socket is a request for the control plane by itself. Without
+        // this, the only way to reach the ci verbs was --ci, which also swaps
+        // the serial backends and redirects every COW overlay into /tmp per pid
+        // -- so a station could have the reset verbs or a persistent disk, not
+        // both.
+        if let Some(p) = &self.ci_socket { cfg.ci_socket = p.clone(); cfg.ci_server = true; }
         if self.ci_display { cfg.ci_display = true; }
         if let Some(p) = &self.serial_log { cfg.serial_log = Some(p.clone()); }
         if let Some(mhz) = self.clock_fixed_mhz { cfg.clock.fixed_mhz = Some(mhz); }

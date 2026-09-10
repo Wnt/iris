@@ -105,6 +105,45 @@
 //! daemon attaching to an already-idle guest (the IRIX login chooser is
 //! perfectly static) would otherwise never see a frame and never come up.
 //!
+//! # Geometry, and the two columns
+//!
+//! The visible rectangle is not a constant: it is decoded from the VC2 video
+//! timings, and the framebuffer behind it is 2048x1024 words regardless. On
+//! this IRIX 6.5 Indy the decode settles at **1282x1024** (`Rex3: Resolution
+//! changed to 1282x1024 cursor_x_adjust=5`), which is what this publisher
+//! declares by default.
+//!
+//! The station's registry declares 1280x1024, and a station's geometry is not
+//! something to renegotiate for two columns — so `IRIS_SHM_GEOMETRY=1280x1024`
+//! makes the publisher crop, once, on the producing side. That is deliberate:
+//! the consumer has no crop knob and must never be asked to guess.
+//!
+//! Worth being accurate about what is discarded. Those two columns are **not
+//! black padding** — measured at the IRIX login, columns 1278 through 1281 all
+//! carry the identical desktop background word (0xFF7D9EC0), i.e. real decoded
+//! picture, and the same is true of the rows behind them. They are overscan at
+//! the right edge of a 1282-wide decode, so cropping them loses two columns of
+//! border and nothing a visitor can name. It is still a crop, not a trim of
+//! nothing, and the guest doc should say so.
+//!
+//! # The hardware cursor, and why it must be re-latched here
+//!
+//! `SwCompositor` places the cursor from `VC2_REG_WORKING_CURSOR_Y` (0x0D).
+//! That register is raster state: the REX3 refresh loop re-latches it from
+//! `VC2_REG_CURSOR_Y_LOC` (0x03) at VBLANK — but `Rex3Screen::refresh()`
+//! snapshots the VC2 registers *before* that re-latch happens. So the snapshot
+//! the compositor sees carries the PREVIOUS frame's working Y, and the drawn
+//! glyph trails the registers by up to a frame: measured at 10-14 px low at
+//! some positions while the registers themselves were exact.
+//!
+//! Invisible in a window (the eye does not mind a cursor one frame behind), but
+//! it is a correctness bug here, because the published frame is the only
+//! evidence the lab accepts that a pointer went where it was told, and a
+//! closed-loop positioner reads the glyph back. So the publisher applies the
+//! re-latch itself, on its own snapshot, immediately before compositing. It
+//! touches only `Rex3Screen`'s cached copy; the device registers and the
+//! windowed path are untouched.
+//!
 //! # FBSYNC — and the stale-page trap it exists for
 //!
 //! The `nextstep` conversion lost a day to this and it is guaranteed to bite
@@ -139,6 +178,10 @@ pub const ENV_PATH: &str = "IRIS_SHM_PATH";
 /// Optional A/B control: `IRIS_SHM_DAMAGE=0` marks every published frame
 /// full-frame instead of deriving a scanline band. Diagnostic only.
 pub const ENV_DAMAGE: &str = "IRIS_SHM_DAMAGE";
+/// Optional `WxH`: publish exactly this rectangle, cropped from the top-left of
+/// whatever VC2 decodes, instead of the decoded rectangle itself. See
+/// "Geometry" in the module docs.
+pub const ENV_GEOMETRY: &str = "IRIS_SHM_GEOMETRY";
 
 /// Fixed header size; pixels start here.
 const HEADER: usize = 64;
@@ -189,17 +232,43 @@ pub fn install(rex3: &Arc<Rex3>) -> std::io::Result<bool> {
         _ => return Ok(false),
     };
     let derive_damage = std::env::var(ENV_DAMAGE).map(|v| v != "0").unwrap_or(true);
+    // `WxH`, or a loud failure. A station that asked for a geometry and silently
+    // got a different one is exactly the class of bug this whole plane exists to
+    // make impossible.
+    let crop = match std::env::var(ENV_GEOMETRY) {
+        Ok(v) if !v.is_empty() => {
+            let bad = || {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("{ENV_GEOMETRY}={v:?} is not WxH (e.g. 1280x1024)"),
+                )
+            };
+            let (w, h) = v.split_once(['x', 'X']).ok_or_else(bad)?;
+            let w: usize = w.trim().parse().map_err(|_| bad())?;
+            let h: usize = h.trim().parse().map_err(|_| bad())?;
+            if w == 0 || h == 0 || w > COMPOSITOR_STRIDE || h > 1024 {
+                return Err(bad());
+            }
+            Some((w, h))
+        }
+        _ => None,
+    };
 
     // Fail here, at install time, rather than on the first frame: a station that
     // cannot publish must refuse to start, not stream a black screen.
-    let pubr = ShmPublisher::new(path.clone(), derive_damage)?;
+    let pubr = ShmPublisher::new(path.clone(), derive_damage, crop)?;
     let _ = REX3.set(rex3.clone());
     *rex3.renderer.lock() = Some(Box::new(pubr));
-    eprintln!(
-        "iris: shm frame plane -> {} (damage={})",
-        path,
-        if derive_damage { "derived" } else { "full-frame" }
-    );
+    match crop {
+        Some((w, h)) => eprintln!(
+            "iris: shm frame plane -> {path} (damage={}, geometry pinned to {w}x{h})",
+            if derive_damage { "derived" } else { "full-frame" }
+        ),
+        None => eprintln!(
+            "iris: shm frame plane -> {path} (damage={}, geometry follows the VC2 decode)",
+            if derive_damage { "derived" } else { "full-frame" }
+        ),
+    }
     Ok(true)
 }
 
@@ -315,6 +384,9 @@ pub struct ShmPublisher {
     compositor: SwCompositor,
     /// Derive a real scanline band (default) or mark every frame full-frame.
     derive_damage: bool,
+    /// `IRIS_SHM_GEOMETRY`: publish exactly this rectangle instead of the
+    /// decoded one, cropping from the top-left.
+    crop: Option<(usize, usize)>,
     /// True until the first frame settles the seqlock after a (re)map, or after
     /// an `FBSYNC`: the next publish writes every row and claims the whole
     /// frame as dirty.
@@ -327,7 +399,7 @@ pub struct ShmPublisher {
 }
 
 impl ShmPublisher {
-    fn new(path: String, derive_damage: bool) -> std::io::Result<Self> {
+    fn new(path: String, derive_damage: bool, crop: Option<(usize, usize)>) -> std::io::Result<Self> {
         // Prove now that the path is writable — an unwritable station directory
         // must fail at start, not silently at the first composite.
         let probe = format!("{path}.probe{}", std::process::id());
@@ -338,6 +410,7 @@ impl ShmPublisher {
             map: None,
             compositor: SwCompositor::new(),
             derive_damage,
+            crop,
             force_full: true,
             shadow: Vec::new(),
             seq: 0,
@@ -383,11 +456,24 @@ impl Renderer for ShmPublisher {
         live_fb_rgb: Option<&[u32]>,
         live_fb_aux: Option<&[u32]>,
     ) {
-        let width = screen.width;
-        let height = screen.height;
-        if width == 0 || height == 0 || width > COMPOSITOR_STRIDE || height > 1024 {
+        let decoded_w = screen.width;
+        let decoded_h = screen.height;
+        if decoded_w == 0 || decoded_h == 0 || decoded_w > COMPOSITOR_STRIDE || decoded_h > 1024 {
             return;
         }
+        // Publish the pinned rectangle if there is one, never more than what was
+        // actually decoded (a crop must not invent pixels).
+        let (width, height) = match self.crop {
+            Some((w, h)) => (w.min(decoded_w), h.min(decoded_h)),
+            None => (decoded_w, decoded_h),
+        };
+
+        // Re-latch the cursor's Y before compositing: `refresh()` snapshotted the
+        // VC2 registers before the VBLANK handler copies CURSOR_Y_LOC into
+        // WORKING_CURSOR_Y, and `SwCompositor` places the glyph from the latter.
+        // Without this the drawn cursor trails the registers by a frame.
+        screen.vc2_regs[crate::vc2::VC2_REG_WORKING_CURSOR_Y as usize] =
+            screen.vc2_regs[crate::vc2::VC2_REG_CURSOR_Y_LOC as usize];
 
         let fbsync = FBSYNC.swap(false, Ordering::AcqRel);
         if fbsync {

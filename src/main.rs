@@ -39,6 +39,7 @@ fn main() {
     let ci_enabled = cfg.ci;
     let ci_display = cfg.ci_display;
     let no_window = cfg.no_window;
+    let ci_server_on = cfg.ci_server;
     let ci_socket_path = cfg.ci_socket.clone();
     let load_elf = cfg.load_elf.clone();
 
@@ -71,7 +72,7 @@ fn main() {
 
     // CI control socket: started after Machine::new so it can hand out the
     // machine pointer + CiSerialBackend to command handlers.
-    let _ci_server = if ci_enabled {
+    let _ci_server = if ci_server_on {
         let mptr: *mut iris::machine::Machine = &mut *machine;
         match iris::ci::start_server(mptr, &ci_socket_path) {
             Ok(s) => Some(s),
