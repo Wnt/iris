@@ -280,6 +280,13 @@ struct BtnItem {
     ack: AckRef,
 }
 
+/// A MOVEP delta being bled out at the pacing budget.
+struct BleedItem {
+    dx: i32,
+    dy: i32,
+    ack: AckRef,
+}
+
 /// A synthetic click: a queue of (button, state, hold-frames) edges.
 struct ClickItem {
     btn: u8,
@@ -556,6 +563,11 @@ fn accept_loop(shared: Arc<Shared>, listener: UnixListener) {
         let id = next_id;
         next_id += 1;
         let Ok(rd) = stream.try_clone() else { continue };
+        // A blocking write to a client that has stopped reading would freeze
+        // the engine thread — and with it every key, button and pointer verb
+        // for every other client. Bound it: a peer that cannot absorb an ack in
+        // two seconds gets a dropped write, not a stalled emulator.
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
         let c = Arc::new(Conn {
             id,
             out: Mutex::new(stream),
@@ -638,6 +650,8 @@ struct Engine {
     key_held: Option<KeyCode>,
     key_next_at: Instant,
     btnq: VecDeque<BtnItem>,
+    bleedq: VecDeque<BleedItem>,
+    bleed_at: Instant,
     clickq: VecDeque<ClickItem>,
     click_at: Instant,
     next_stat: Instant,
@@ -658,6 +672,8 @@ fn engine_loop(shared: Arc<Shared>) {
         key_held: None,
         key_next_at: now,
         btnq: VecDeque::new(),
+        bleedq: VecDeque::new(),
+        bleed_at: now,
         clickq: VecDeque::new(),
         click_at: now,
         next_stat: now + cfg.stat_period,
@@ -676,6 +692,7 @@ fn engine_loop(shared: Arc<Shared>) {
         // 2. run the pacers
         e.step_keys();
         e.step_clicks();
+        e.step_bleed();
         e.step_flight();
         e.step_btns();
         e.step_stats();
@@ -789,9 +806,15 @@ impl Engine {
                 }
                 // Paced relative: an arbitrarily large jump bled out at
                 // MOVE_STEP counts per window so no packet overflows and the
-                // guest's 100 Hz sampler sees every count. Acks when drained,
-                // which is what makes it the calibration verb.
-                self.bleed_rel(dx as i32, dy as i32, &ack);
+                // guest's 100 Hz sampler sees every count. Acks when DRAINED,
+                // which is what makes it the calibration verb. Queued, never
+                // slept on: this is the one thread that applies keys and button
+                // edges too, and a 4000-count sweep must not freeze them.
+                self.bleedq.push_back(BleedItem {
+                    dx: dx as i32,
+                    dy: dy as i32,
+                    ack,
+                });
             }
             "MOVEA" => {
                 let Some((x, y)) = two_longs(rest) else {
@@ -961,23 +984,34 @@ impl Engine {
 
     // ---- pacers -----------------------------------------------------------
 
-    /// Bleed a relative delta out at the pacing budget, synchronously on this
-    /// thread's tick loop, then ack. Bounded by construction.
-    fn bleed_rel(&mut self, mut dx: i32, mut dy: i32, ack: &AckRef) {
-        let step = self.shared.cfg.move_step;
-        let mut guard = 0u32;
-        while (dx != 0 || dy != 0) && guard < 20_000 {
-            let sx = dx.clamp(-step, step);
-            let sy = dy.clamp(-step, step);
-            self.push_mouse(sx, sy);
-            dx -= sx;
-            dy -= sy;
-            guard += 1;
-            if dx != 0 || dy != 0 {
-                thread::sleep(self.shared.cfg.move_window);
-            }
+    /// One window's worth of the head MOVEP bleed. Acks when the entry is
+    /// fully drained.
+    fn step_bleed(&mut self) {
+        if Instant::now() < self.bleed_at {
+            return;
         }
-        self.shared.reply_ok(ack, "");
+        let step = self.shared.cfg.move_step;
+        let (sx, sy) = {
+            let Some(item) = self.bleedq.front_mut() else {
+                return;
+            };
+            let sx = item.dx.clamp(-step, step);
+            let sy = item.dy.clamp(-step, step);
+            item.dx -= sx;
+            item.dy -= sy;
+            (sx, sy)
+        };
+        self.push_mouse(sx, sy);
+        let drained = self
+            .bleedq
+            .front()
+            .map(|i| i.dx == 0 && i.dy == 0)
+            .unwrap_or(false);
+        if drained {
+            let done = self.bleedq.pop_front().unwrap();
+            self.shared.reply_ok(&done.ack, "");
+        }
+        self.bleed_at = Instant::now() + self.shared.cfg.move_window;
     }
 
     /// Key edge pacing. Unlike a scanned MAME matrix there is no field to hold
