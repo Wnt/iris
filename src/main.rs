@@ -83,6 +83,27 @@ fn main() {
         None
     };
 
+    // Kernel Hive host-native input plane: a `mamectl/1` unix socket
+    // (`src/ctlsock.rs`) speaking the wire streamhost's `mamesock` backend
+    // already talks to MAME and to `Wnt/previous`. Gated on IRIS_CTL_SOCK, and
+    // deliberately NOT on --ci: the station wants the input plane without the
+    // ci socket's per-pid /tmp COW overlay redirect or its SCC replacement.
+    let _ctl_server = match std::env::var("IRIS_CTL_SOCK") {
+        Ok(path) if !path.trim().is_empty() => {
+            let mptr: *mut iris::machine::Machine = &mut *machine;
+            // SAFETY: `machine` lives on main's stack for the process lifetime,
+            // the same contract `iris::ci::start_server` takes above.
+            match unsafe { iris::ctlsock::start_server(mptr, path.trim()) } {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    eprintln!("iris: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        _ => None,
+    };
+
     // DIAG: optionally enable verbose logging from startup via IRIS_DEBUG_LOG.
     // IRIS_DEBUG_LOG="mc,mips" enables those modules. "all" enables everything.
     // Output is broadcast to a stderr sink so jit-diag.sh's tee captures it inline.

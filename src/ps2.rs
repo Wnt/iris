@@ -409,6 +409,25 @@ impl Ps2Controller {
         self.update_interrupt();
     }
 
+    /// Are the guest's keyboard and AUX ports actually accepting injection?
+    ///
+    /// `push_kb` and `push_mouse_input` return early — silently, with no error
+    /// — unless the controller is running, the device is enabled and the
+    /// matching i8042 CTR disable bit is clear. A control plane that injects
+    /// into a disabled port sees nothing happen and gets no signal, which is
+    /// exactly how a rig comes out looking perfectly healthy while the guest
+    /// ignores every verb. Returns `(keyboard_ok, mouse_ok)`.
+    pub fn input_ready(&self) -> (bool, bool) {
+        if !self.running.load(Ordering::Relaxed) {
+            return (false, false);
+        }
+        let state = self.state.lock();
+        (
+            state.scanning_enabled && state.config & 0x10 == 0,
+            state.mouse_enabled && state.config & 0x20 == 0,
+        )
+    }
+
     /// Push a scancode byte to the keyboard queue (called from UI)
     pub fn push_kb(&self, key: KeyCode, pressed: bool) {
         if !self.running.load(Ordering::Relaxed) { return; }
