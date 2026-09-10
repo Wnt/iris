@@ -305,6 +305,15 @@ pub fn dispatch(m: &mut Machine, verb: &str, rest: &str) -> Reply {
     }
 }
 
+
+/// Re-arm the guest's input after a restore. See
+/// `Ps2Controller::resync_interrupt_after_restore` — a restored machine
+/// reinstates an already-asserted interrupt line, and the guest kernel is
+/// waiting for an edge that will never come.
+fn resync_input(m: &Machine) {
+    m.hpc3().ioc().ps2().resync_interrupt_after_restore();
+}
+
 /// `SAVEST <name>` — capture a checkpoint under a temp name, stamp its
 /// provenance, then rename it over the old one.
 fn do_savest(m: &mut Machine, name: &str) -> Reply {
@@ -340,6 +349,11 @@ fn do_savest(m: &mut Machine, name: &str) -> Reply {
         return Reply::Err("busy", format!("promote '{}': {}", name, e));
     }
     let ms = t0.elapsed().as_millis();
+    // The cached in-memory rollback checkpoint describes the state captured at
+    // the last RESTORE, which is now the OLD contents of this name. Drop it, or
+    // a following `LOADST <name>` would take the fast path and rewind to the
+    // previous checkpoint under the new checkpoint's name.
+    m.invalidate_rollback_checkpoint();
     // A save stops and restarts the CPU and rewrites the framebuffer chunk
     // manifest; republish so a publisher shadow cannot go stale over it.
     let had = fbsync();
@@ -383,6 +397,7 @@ fn do_loadst(m: &mut Machine, name: &str) -> Reply {
         return Reply::Err("badarg", format!("{} failed: {}", via, e));
     }
     let ms = t0.elapsed().as_millis();
+    resync_input(m);
     // UNCONDITIONAL: see the stale-page trap at the top of this file.
     let had = fbsync();
     Reply::Ok(format!(
@@ -404,6 +419,7 @@ fn do_reset(m: &mut Machine) -> Reply {
         return Reply::Err("badarg", format!("rollback failed: {}", e));
     }
     let ms = t0.elapsed().as_millis();
+    resync_input(m);
     let had = fbsync();
     Reply::Ok(format!(
         "ms={} via={} fbsync={}",
@@ -469,6 +485,45 @@ pub fn startup_restore(m: &mut Machine) {
             return;
         }
     };
+    // THE WARMUP, AND WHY IT IS NOT A SLEEP.
+    // Measured on the bring-up rig: restoring into a machine that has never
+    // executed leaves IRIX alive but not servicing the i8042 — the keyboard
+    // queue fills (`ps2 status` rx_queue_len climbs, never drains) and the
+    // desktop takes no input, while every other symptom looks healthy. The
+    // same snapshot restored into a machine that has run for a few seconds
+    // keeps input live. So: start the CPU, wait for the guest to reach a real
+    // milestone, and only then restore.
+    //
+    // The milestone is VC2 having decoded a display mode. It is zero until the
+    // PROM programs the video timing generator, so it is a FACT about guest
+    // execution rather than a guessed duration (AGENTS.md rule 14).
+    m.cpu_start();
+    let warm_deadline = std::env::var("KH_WARMUP_DEADLINE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(120_000);
+    let warm_t0 = Instant::now();
+    let mut warmed = false;
+    while warm_t0.elapsed().as_millis() < warm_deadline as u128 {
+        if m.get_rex3().map(|r| r.display_size()).unwrap_or((0, 0)) != (0, 0) {
+            warmed = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    if warmed {
+        eprintln!(
+            "KH-RESET: guest reached VC2 mode decode in {} ms — restoring '{}'",
+            warm_t0.elapsed().as_millis(),
+            name
+        );
+    } else {
+        eprintln!(
+            "KH-RESET: guest never decoded a display mode within {} ms; restoring '{}' anyway.              If input is dead after this launch, that is the never-executed-machine restore              defect and the launcher should cold boot instead.",
+            warm_deadline, name
+        );
+    }
+
     let t0 = Instant::now();
     match dispatch(m, "LOADST", &name) {
         Reply::Ok(d) => eprintln!(
@@ -496,7 +551,21 @@ unsafe impl Sync for MachinePtr {}
 
 struct Server {
     machine: Arc<Mutex<MachinePtr>>,
-    banner: String,
+    rex3: Option<Arc<crate::rex3::Rex3>>,
+}
+
+impl Server {
+    fn banner(&self) -> String {
+        let (w, h) = self.rex3.as_ref().map(|r| r.display_size()).unwrap_or((0, 0));
+        format!(
+            "HELLO {} iris-{} indy caps={} screen={}x{}\n",
+            PROTO_ID,
+            option_env!("IRIS_GIT_REV").unwrap_or("unknown"),
+            caps_fragment(),
+            w,
+            h
+        )
+    }
 }
 
 /// Bind `IRIS_KH_CTL_SOCK` and serve the reset verbs over `mamectl/1`.
@@ -509,23 +578,15 @@ pub unsafe fn start_server(machine_ptr: *mut Machine) -> Result<(), String> {
         Ok(p) if !p.is_empty() => p,
         _ => return Ok(()),
     };
-    let (w, h) = (*machine_ptr)
-        .get_rex3()
-        .map(|r| r.display_size())
-        .unwrap_or((1280, 1024));
-    let banner = format!(
-        "HELLO {} iris-{} indy caps={} screen={}x{}\n",
-        PROTO_ID,
-        option_env!("IRIS_GIT_REV").unwrap_or("unknown"),
-        caps_fragment(),
-        w,
-        h
-    );
+    // The banner's screen= is what a client clamps to, so it must be read at
+    // CONNECT time, not here: at startup VC2 has not decoded a mode yet and the
+    // geometry is 0x0.
+    let rex3 = (*machine_ptr).get_rex3();
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path).map_err(|e| format!("bind {}: {}", path, e))?;
     let server = Arc::new(Server {
         machine: Arc::new(Mutex::new(MachinePtr(machine_ptr))),
-        banner,
+        rex3,
     });
     eprintln!("KH-RESET: mamectl/1 reset socket listening at {}", path);
     thread::Builder::new()
@@ -548,7 +609,7 @@ fn serve(server: Arc<Server>, stream: UnixStream) {
         Ok(s) => s,
         Err(_) => return,
     };
-    if out.write_all(server.banner.as_bytes()).is_err() {
+    if out.write_all(server.banner().as_bytes()).is_err() {
         return;
     }
     let _ = out.flush();

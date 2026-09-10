@@ -1397,6 +1397,19 @@ impl Machine {
         self.last_restore_checkpoint.is_some()
     }
 
+    /// Drop the cached in-memory rollback checkpoint, forcing the next
+    /// `ci_rollback`/`LOADST` down the disk path.
+    ///
+    /// kernel-hive: this is what a RECAPTURE must call. After `SAVEST golden`
+    /// promotes a new `saves/golden`, the cached checkpoint still describes
+    /// the state captured at the LAST restore of the old golden — so a
+    /// `LOADST golden` taking the fast in-memory path would rewind to the
+    /// previous checkpoint under the new checkpoint's name. Correct-looking
+    /// and wrong, which is the worst kind.
+    pub fn invalidate_rollback_checkpoint(&mut self) {
+        self.last_restore_checkpoint = None;
+    }
+
     /// Full rewind: load the named snapshot, which now captures the COW
     /// overlay too so the filesystem state is deterministic per snapshot.
     /// The CPU resumes automatically (load_snapshot restarts it). After the

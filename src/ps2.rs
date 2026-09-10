@@ -88,6 +88,28 @@ impl Ps2Controller {
         }
     }
 
+    /// kernel-hive: force an interrupt EDGE after a snapshot restore.
+    ///
+    /// `update_interrupt` only states a level. A restore reinstates the IOC
+    /// with the KBD_MOUSE line already asserted (it was asserted when the
+    /// snapshot was taken) AND the i8042's receive queue with bytes still in
+    /// it — but the guest kernel, in the restored process, has already
+    /// acknowledged that interrupt and is waiting for the next EDGE. Setting
+    /// the same level again is a no-op, so the queue never drains and the
+    /// keyboard is dead for the life of the guest, while every symptom a
+    /// health check looks at reads normal: the device says running, scanning
+    /// enabled, ports on, and `ps2 status` shows a queue that simply never
+    /// moves.
+    ///
+    /// Deassert, then reassert. Called by the reset plane after every restore
+    /// — the analogue of MAME's `reseed_after_restore` on the ctlsock module.
+    pub fn resync_interrupt_after_restore(&self) {
+        if let Some(cb) = &self.callback {
+            cb.set_interrupt(false);
+        }
+        self.update_interrupt();
+    }
+
     /// Read a byte from the data port (0x40)
     pub fn read_data(&self) -> u8 {
         let mut state = self.state.lock();
@@ -917,7 +939,7 @@ impl Device for Ps2Controller {
     fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
-        vec![("ps2".to_string(), "PS/2 commands: ps2 debug <on|off> | ps2 type <ascii> | ps2 enter | ps2 mouse <dx> <dy> [buttons] [repeat] | ps2 status".to_string())]
+        vec![("ps2".to_string(), "PS/2 commands: ps2 debug <on|off> | ps2 type <ascii> | ps2 enter | ps2 key <KeyCode> <0|1|tap> | ps2 mouse <dx> <dy> [buttons] [repeat] | ps2 status".to_string())]
     }
 
     fn execute_command(&self, cmd: &str, args: &[&str], mut writer: Box<dyn Write + Send>) -> Result<(), String> {
@@ -970,6 +992,29 @@ impl Device for Ps2Controller {
                 writeln!(writer, "PS/2: mouse dx={} dy={} buttons={:#04x} x{}", dx, dy, btn, n.max(1)).unwrap();
                 return Ok(());
             }
+            // kernel-hive: `ps2 type` is printable ASCII only, which is not
+            // enough to drive a real guest UI — a modal dialog wants Space on
+            // its focused button, a text field wants Backspace, a form wants
+            // Tab. Named winit KeyCode edges, press and release separately, so
+            // a held modifier is expressible too.
+            if !args.is_empty() && args[0] == "key" {
+                let name = args.get(1).copied().unwrap_or("");
+                let k = match name_to_keycode(name) {
+                    Some(k) => k,
+                    None => return Err(format!("ps2 key: unknown KeyCode '{}'", name)),
+                };
+                match args.get(2).copied() {
+                    Some("0") => self.push_kb(k, false),
+                    Some("1") | None => self.push_kb(k, true),
+                    Some("tap") => {
+                        self.push_kb(k, true);
+                        self.push_kb(k, false);
+                    }
+                    Some(other) => return Err(format!("ps2 key: state must be 0|1|tap, not '{}'", other)),
+                }
+                writeln!(writer, "PS/2: key {} {}", name, args.get(2).copied().unwrap_or("1")).unwrap();
+                return Ok(());
+            }
             if !args.is_empty() && args[0] == "status" {
                 let s = self.state.lock();
                 writeln!(writer, "PS/2 state: running={} scanning_enabled={} mouse_enabled={} mouse_id={} rx_queue_len={} mouse_queue_bytes={} scancode_set={} config={:02x} last_read={:02x}",
@@ -978,10 +1023,45 @@ impl Device for Ps2Controller {
                     s.mouse_queue_bytes, s.scancode_set, s.config, s.last_read).unwrap();
                 return Ok(());
             }
-            return Err("Usage: ps2 debug <on|off> | ps2 type <ascii> | ps2 enter | ps2 mouse <dx> <dy> [buttons] [repeat] | ps2 status".to_string());
+            return Err("Usage: ps2 debug <on|off> | ps2 type <ascii> | ps2 enter | ps2 key <KeyCode> <0|1|tap> | ps2 mouse <dx> <dy> [buttons] [repeat] | ps2 status".to_string());
         }
         Err("Command not found".to_string())
     }
+}
+
+/// kernel-hive: winit `KeyCode` variant names for the keys a guest UI needs
+/// that are not printable ASCII. Letters and digits fall through to
+/// `ascii_to_keycode`, so `ps2 key KeyA tap` and `ps2 key a tap` both work.
+fn name_to_keycode(name: &str) -> Option<KeyCode> {
+    use KeyCode::*;
+    Some(match name {
+        "Space" => Space,
+        "Backspace" => Backspace,
+        "Enter" | "Return" => Enter,
+        "Escape" | "Esc" => Escape,
+        "Tab" => Tab,
+        "Delete" => Delete,
+        "ArrowUp" | "Up" => ArrowUp,
+        "ArrowDown" | "Down" => ArrowDown,
+        "ArrowLeft" | "Left" => ArrowLeft,
+        "ArrowRight" | "Right" => ArrowRight,
+        "Home" => Home,
+        "End" => End,
+        "ShiftLeft" => ShiftLeft,
+        "ShiftRight" => ShiftRight,
+        "ControlLeft" | "Control" => ControlLeft,
+        "ControlRight" => ControlRight,
+        "AltLeft" | "Alt" => AltLeft,
+        "AltRight" => AltRight,
+        other => {
+            let mut ch = other.chars();
+            let c = ch.next()?;
+            if ch.next().is_some() {
+                return None;
+            }
+            return ascii_to_keycode(c).map(|(k, _)| k);
+        }
+    })
 }
 
 fn ascii_to_keycode(c: char) -> Option<(KeyCode, bool)> {
