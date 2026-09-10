@@ -206,6 +206,7 @@ pub mod scsi;
 pub mod wd33c93a;
 pub mod hal2;
 pub mod ps2;
+pub mod ctlsock;
 pub mod ui;
 pub mod rex3;
 pub mod rex3_simd;
